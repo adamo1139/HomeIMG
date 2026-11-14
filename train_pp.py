@@ -1222,7 +1222,8 @@ def main():
         if alt_suffix:
             log(f"captions: {100 * args.pl_prob:.0f}% Polish ({alt_suffix}), the rest English")
         stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=step,
-                             sort_pad=LM_PAD if hf_lm else None, rows=args.opd)
+                             sort_pad=LM_PAD if hf_lm else None, rows=args.opd,
+                             res_groups=[(r, n * k) for r, n, k in mr_groups] or None)
         loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
                                                   pin_memory=device.type == "cuda",
                                                   prefetch_factor=2 if args.workers else None,
@@ -1489,22 +1490,18 @@ def main():
         return h
 
     def multi_res_batch(at, lat, ids, ids_cpu, rows, mcond):
-        """--multi-res: the step's images assigned to the resolution groups at random (the loader sorts them by caption
-        length), downscaled on the GPU, encoded; per group its latents (or a VAE-server handle), t (shifted for that
-        resolution) and noise. -> (groups, ids, None, None, cond, cond_cpu, rows, mcond); groups: list of dicts."""
+        """--multi-res: the loader already assigned the step's images to the resolution groups at random and decoded
+        each group at its size (TrainStream res_groups: a tuple of uint8 batches, captions in group order); here they
+        are encoded; per group its latents (or a VAE-server handle), t (shifted for that resolution) and noise.
+        -> (groups, ids, None, None, cond, cond_cpu, rows, mcond); groups: list of dicts."""
         g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
         g_cpu = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
-        perm = torch.randperm(per_pipe, generator=g_cpu)
-        u8_all = lat.to(device, non_blocking=True)
         groups, o = [], 0
         with profile.phase("vae_encode"):
-            for r, n, k in mr_groups:
-                idx = perm[o:o + n * k]
+            for (r, n, k), u8 in zip(mr_groups, lat):
+                idx = torch.arange(o, o + n * k)
                 o += n * k
-                u8 = u8_all[idx.to(device)]
-                if r != args.res:
-                    u8 = F.interpolate(u8.float(), size=(r, r), mode="bicubic", antialias=True).round().clamp(0, 255)
-                    u8 = u8.to(torch.uint8)
+                u8 = u8.to(device, non_blocking=True)
                 side = r // 16
                 t = shift_t(torch.sigmoid(torch.randn(n * k, device=device, generator=g)), r)
                 eps = torch.randn(n * k, den_cfg.latent_channels, side, side, device=device, generator=g)

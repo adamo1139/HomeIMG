@@ -156,13 +156,14 @@ class ShardStore:
             self._crop = [[np.load(os.path.join(r or self.root, f"{n}.{k}.npy"), mmap_mode="r") for n in self.names]
                           for k, r in self.crops]
 
-    def fetch(self, indices: np.ndarray, rng: np.random.Generator | None, rows: bool = False):
+    def fetch(self, indices: np.ndarray, rng: np.random.Generator | None, rows: bool = False, res: int = 0):
         """Latents + one caption per image (random if rng is given, else the first one). rows: also (B, 2) [shard,
         caption row] of the caption picked (-1 for images without one); the row is the same in the translated files,
-        so it also finds the English original of a Polish caption (CaptionText)."""
+        so it also finds the English original of a Polish caption (CaptionText). res: images decoded at this size
+        instead of img_res (mixed-resolution batches)."""
         self._open()
         picked = np.full((len(indices), 2), -1, dtype=np.int64)
-        res = self.img_res
+        res = res or self.img_res
         lat = (np.empty((len(indices), 3, res, res), dtype=np.uint8) if res
                else np.empty((len(indices), *self._lat[0].shape[1:]), dtype=np.float16))
         ids = np.empty((len(indices), self._tok[0].shape[1]), dtype=np.int64)
@@ -222,7 +223,7 @@ class ConcatStore:
     def __len__(self):
         return int(self.starts[-1])
 
-    def fetch(self, indices: np.ndarray, rng, rows: bool = False):
+    def fetch(self, indices: np.ndarray, rng, rows: bool = False, res: int = 0):
         indices = np.asarray(indices)
         which = np.searchsorted(self.starts, indices, side="right") - 1
         lat = ids = None
@@ -230,7 +231,7 @@ class ConcatStore:
             pos = np.nonzero(which == k)[0]
             if not len(pos):
                 continue
-            got = store.fetch(indices[pos] - self.starts[k], rng)
+            got = store.fetch(indices[pos] - self.starts[k], rng, res=res)
             assert len(got) == 2, "ConcatStore: stores with micro-conditions are not supported"
             if lat is None:
                 lat = np.empty((len(indices), *got[0].shape[1:]), dtype=got[0].dtype)
@@ -270,12 +271,17 @@ class TrainStream(IterableDataset):
     """
 
     def __init__(self, store: ShardStore, micro_batch: int, rank: int, world: int, seed: int, start_micro: int = 0,
-                 sort_pad=None, rows: bool = False):
+                 sort_pad=None, rows: bool = False, res_groups=None):
         """sort_pad: caption pad id -> rows ordered by caption length (stable), here in the worker, so the loader's
         pinned batch reaches the GPU without another copy (train_pp.py's similar-length micro-batches). rows: also
-        yield ShardStore.fetch's (B, 2) caption rows."""
+        yield ShardStore.fetch's (B, 2) caption rows. res_groups: [(res, n images)] summing to micro_batch: the batch's
+        images go to the groups at random and each group is decoded at its own size (a JPEG at 1/2, 1/4 scale costs a
+        fraction of the full decode and memory); then the images come as a tuple of (n, 3, res, res) arrays, the
+        captions concatenated in group order (sorted by length within each group)."""
         self.store, self.mb, self.rank, self.world = store, micro_batch, rank, world
         self.seed, self.start, self.sort_pad, self.rows = seed, start_micro, sort_pad, rows
+        self.res_groups = res_groups
+        assert not res_groups or sum(n for _, n in res_groups) == micro_batch
         self.per_epoch = len(store) // (micro_batch * world)  # micro-batches per rank per epoch
 
     def __iter__(self):
@@ -290,6 +296,10 @@ class TrainStream(IterableDataset):
                 perm_epoch = epoch
             g0 = k * self.mb * self.world + self.rank * self.mb
             idx = np.sort(perm[g0:g0 + self.mb])
+            if self.res_groups:
+                yield self._mixed(idx, m)
+                m += nw
+                continue
             got = self.store.fetch(idx, np.random.default_rng([self.seed, m, self.rank, 1]), rows=True)
             lat, ids, picked, *cond = (torch.from_numpy(x) for x in got)
             if self.sort_pad is not None:
@@ -297,6 +307,22 @@ class TrainStream(IterableDataset):
                 lat, ids, picked, cond = lat[order], ids[order], picked[order], [c[order] for c in cond]
             yield ((lat, ids, picked) if self.rows else (lat, ids)) + tuple(cond)
             m += nw
+
+
+    def _mixed(self, idx, m):
+        rng = np.random.default_rng([self.seed, m, self.rank, 1])
+        idx = idx[np.random.default_rng([self.seed, m, self.rank, 2]).permutation(len(idx))]  # images -> groups
+        lats, ids, picked, o = [], [], [], 0
+        for res, n in self.res_groups:
+            lat, ids_g, picked_g = (torch.from_numpy(x) for x in self.store.fetch(np.sort(idx[o:o + n]), rng,
+                                                                                  rows=True, res=res))
+            o += n
+            if self.sort_pad is not None:
+                order = ids_g.ne(self.sort_pad).sum(1).argsort(stable=True)
+                lat, ids_g, picked_g = lat[order], ids_g[order], picked_g[order]
+            lats.append(lat), ids.append(ids_g), picked.append(picked_g)
+        out = (tuple(lats), torch.cat(ids))
+        return out + (torch.cat(picked),) if self.rows else out
 
 
 def val_groups(root: str, names, n: int):
