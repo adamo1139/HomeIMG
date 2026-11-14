@@ -428,6 +428,7 @@ def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None, groups=
     te.eval(), den.eval()
     tot, n = 0.0, 0
     buckets = torch.zeros(4), torch.zeros(4)
+    hi = torch.zeros(2)  # t >= 0.9: the composition range (only ~1.4% of the logit-normal draw, ~57 of 4096: noisy)
     per_all = []
     for i in range(0, len(lat), chunk):
         x0 = lat[i:i + chunk].to(device).float()
@@ -451,10 +452,13 @@ def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None, groups=
         b = (t.cpu() * 4).long().clamp(max=3)
         buckets[0].index_add_(0, b, per)
         buckets[1].index_add_(0, b, torch.ones_like(per))
+        m = t.cpu() >= 0.9
+        hi += torch.stack([per[m].sum(), m.sum().float()])
     te.train(), den.train()
     out = {"val/loss": tot / n}
     for k in range(4):
         out[f"val/loss_t{k / 4:.2f}-{(k + 1) / 4:.2f}"] = (buckets[0][k] / buckets[1][k].clamp(min=1)).item()
+    out["val/loss_t0.90-1.00"] = (hi[0] / hi[1].clamp(min=1)).item()
     per_all, i = torch.cat(per_all), 0
     for label, count in groups:
         out[f"val_{label}/loss"] = per_all[i:i + count].mean().item()
