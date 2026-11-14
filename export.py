@@ -108,6 +108,10 @@ def main():
     p.add_argument("out")
     p.add_argument("--ref", default="AuroraIMG2-50M-Preview")
     p.add_argument("--no-ema", action="store_true")
+    p.add_argument("--time-shift", type=float, default=None,
+                   help="the pipeline's default time shift (default: the checkpoint's training --t-shift)")
+    p.add_argument("--time-shift-ref", type=float, default=None,
+                   help="default shift res / REF per resolution (default: the checkpoint's --t-shift-ref)")
     args = p.parse_args()
 
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False, mmap=True)
@@ -143,10 +147,18 @@ def main():
         with open(cfg_path) as f:
             cfg = json.load(f)
         cfg.update(asdict(model_cfg))  # our sizes, the reference's _class_name / _diffusers_version
+        if sub == "transformer":  # the time shift it was trained with, the pipeline's default
+            targs = ck.get("args", {}) or {}
+            cfg["time_shift"] = args.time_shift if args.time_shift is not None else float(targs.get("t_shift", 1.0))
+            cfg["time_shift_ref"] = (args.time_shift_ref if args.time_shift_ref is not None
+                                     else float(targs.get("t_shift_ref", 0) or 0))
         with open(cfg_path, "w") as f:
             json.dump(cfg, f, indent=2)
     kind = "live" if args.no_ema else ("WSM-merged" if "wsm" in ck else "EMA")
-    print(f"exported step {ck['step']} ({kind} weights) to {args.out}")
+    with open(os.path.join(args.out, "transformer", "config.json")) as f:
+        tc = json.load(f)
+    print(f"exported step {ck['step']} ({kind} weights) to {args.out}; default time shift "
+          + (f"res / {tc['time_shift_ref']:g}" if tc["time_shift_ref"] else f"{tc['time_shift']:g}"))
 
 
 if __name__ == "__main__":

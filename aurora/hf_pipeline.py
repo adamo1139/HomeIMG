@@ -602,7 +602,11 @@ class AuroraDenoiser(ModelMixin, ConfigMixin):
         latent_layout: str = "flux2_pipeline",
         rope_ref: int = 0,
         micro_cond: int = 0,
+        time_shift: float = 1.0,
+        time_shift_ref: float = 0.0,
     ):
+        # time_shift / time_shift_ref: the time shift the model was trained with (one value, or res / time_shift_ref per
+        # resolution); the pipeline samples with it by default. Not used by the network itself.
         super().__init__()
         self.patch_in = nn.Linear(latent_channels, dim, bias=False)
         self.time_mlp = nn.Sequential(nn.Linear(256, dim), nn.SiLU(), nn.Linear(dim, dim))
@@ -784,8 +788,8 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
             output_type: "pil", "np", "pt" (tensor in [0,1]) or "latent" (raw model latents).
             resolution: square output size in pixels, a multiple of 16 (default: the trained one, 256). Other sizes
                 were not trained (any of them may come out poorly).
-            time_shift: t -> s t / (1 + (s - 1) t) on the time grid (s > 1: more steps at high noise); default 1
-                (none), as the released models were trained.
+            time_shift: t -> s t / (1 + (s - 1) t) on the time grid (s > 1: more steps at high noise); default: the
+                shift the model was trained with (transformer config time_shift, or resolution / time_shift_ref).
             rope_ref: override the model's RoPE position field (build_rope_2d's ref; 0 = integer positions), e.g.
                 the trained grid side to sample another resolution with the trained spatial scale.
             attn_scale: multiplies the image self-attention logits, e.g. ln(n) / ln(n_trained) for n image tokens
@@ -809,7 +813,10 @@ class AuroraIMG2Pipeline(DiffusionPipeline):
         side = tcfg.latent_size if resolution is None else int(resolution) // 16
         if side < 1 or (resolution is not None and int(resolution) % 16):
             raise ValueError("resolution must be a positive multiple of 16")
-        shift = 1.0 if time_shift is None else float(time_shift)
+        if time_shift is None:  # as trained
+            ref = float(tcfg.get("time_shift_ref", 0.0) or 0.0)
+            time_shift = 16 * side / ref if ref else float(tcfg.get("time_shift", 1.0) or 1.0)
+        shift = float(time_shift)
         shape = (b, tcfg.latent_channels, side, side)
         if latents is None:
             z = randn_tensor(shape, generator=generator, device=device, dtype=torch.float32)
