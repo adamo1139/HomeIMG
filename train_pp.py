@@ -877,6 +877,7 @@ def main():
             f"--multi-res: {per_mr} images per replica and step, so --batch must be {replicas * per_mr}"
         args.microbatches = sum(n for _, n, _ in mr_groups)
         torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)  # shapes x text widths
+        torch._dynamo.config.automatic_dynamic_shapes = False  # every shape its own static graph, no dynamic recompiles
     per_pipe = args.batch // replicas
     M = args.microbatches or 4 * pp
     assert per_pipe * replicas == args.batch and (mr_groups or per_pipe % M == 0), \

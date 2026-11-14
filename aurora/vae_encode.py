@@ -22,7 +22,9 @@ class LatentEncoder:
         self.std = torch.sqrt(vae.bn.running_var.float() + eps).view(1, -1, 1, 1).to(device)
         self.chunk = chunk
         if compile:  # ~25% faster at 1024 px (102 -> 78 ms/img on a 5080); outputs differ only by bf16 rounding
-            self.vae.encoder = torch.compile(self.vae.encoder)
+            # static shapes: one compiled graph per (images, resolution); dynamic shapes recompiled slowly and noisily
+            # with mixed resolutions (train_pp.py --multi-res raises the cache limit)
+            self.vae.encoder = torch.compile(self.vae.encoder, dynamic=False)
 
     @torch.no_grad()
     def __call__(self, img: torch.Tensor) -> torch.Tensor:
