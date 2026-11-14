@@ -427,8 +427,13 @@ def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None, groups=
     eps_all = torch.randn(lat.shape, generator=g)
     te.eval(), den.eval()
     tot, n = 0.0, 0
+    # every 8th sample gets t uniform in [0.9, 1) (its own generator: noise and the other samples unchanged), the
+    # composition range the logit-normal draw barely reaches (~58 of 4096); it is reported only as val/loss_t0.90-1.00,
+    # everything else is computed on the other 7/8 (the same t and noise as before)
+    hi_mask = torch.arange(len(lat)) % 8 == 7
+    t_all[hi_mask] = 0.9 + 0.1 * torch.rand(int(hi_mask.sum()), generator=torch.Generator().manual_seed(seed + 7))
     buckets = torch.zeros(4), torch.zeros(4)
-    hi = torch.zeros(2)  # t >= 0.9: the composition range (only ~1.4% of the logit-normal draw, ~57 of 4096: noisy)
+    hi = torch.zeros(2)
     per_all = []
     for i in range(0, len(lat), chunk):
         x0 = lat[i:i + chunk].to(device).float()
@@ -447,13 +452,14 @@ def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None, groups=
                            for j in range(0, len(x0), dc)])
         per = (v.float() - (eps - x0)).pow(2).mean(dim=(1, 2, 3)).cpu()
         per_all.append(per)
+        m = hi_mask[i:i + chunk]
+        hi += torch.stack([per[m].sum(), m.sum().float()])
+        per, tc = per[~m], t.cpu()[~m]
         tot += per.sum().item()
         n += len(per)
-        b = (t.cpu() * 4).long().clamp(max=3)
+        b = (tc * 4).long().clamp(max=3)
         buckets[0].index_add_(0, b, per)
         buckets[1].index_add_(0, b, torch.ones_like(per))
-        m = t.cpu() >= 0.9
-        hi += torch.stack([per[m].sum(), m.sum().float()])
     te.train(), den.train()
     out = {"val/loss": tot / n}
     for k in range(4):
@@ -461,7 +467,8 @@ def evaluate(te, den, val, device, seed=1234, chunk=256, lm_states=None, groups=
     out["val/loss_t0.90-1.00"] = (hi[0] / hi[1].clamp(min=1)).item()
     per_all, i = torch.cat(per_all), 0
     for label, count in groups:
-        out[f"val_{label}/loss"] = per_all[i:i + count].mean().item()
+        keep = ~hi_mask[i:i + count]
+        out[f"val_{label}/loss"] = per_all[i:i + count][keep].mean().item()
         i += count
     return out
 
