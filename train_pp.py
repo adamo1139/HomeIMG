@@ -1256,6 +1256,14 @@ def main():
                                 args.enc_vae, log)
             val_extra[f"val_{os.path.basename(d.rstrip('/'))}"] = [v, None]
             log(f"validation: {len(v[0])} images of {d}/{held} as val_{os.path.basename(d.rstrip('/'))}")
+    # --multi-res: the same held-out images and captions at every lower resolution of the mix (own latent cache)
+    val_res = {}
+    if master and img_res and val_names:
+        for r in sorted(r_ for r_ in args.multi_res if r_ != args.res):
+            v = load_val_cached(args.data, val_names, args.val_samples, tok_suffix, te.null_ids(), "img",
+                                args.img_dir, r, enc_val, args.enc_vae, log)
+            val_res[r] = v[0]
+            log(f"validation at {r} px: the same {len(v[0])} images, logged as val_{r}px/...")
     if args.lm_split and replica == 0 and val_names:  # held-out LM states once, in evaluate()'s chunks
         ids_val = (val if master else load_val(args.data, val_names, args.val_samples, tok_suffix,
                                                 ids_enc.null_ids(), "img" if img_res else lat_kind,
@@ -1398,6 +1406,14 @@ def main():
                 for k, x in got.items():
                     sums[k] += x * len(v[0])
             res.update({k.replace("val/", "val_all/", 1): s / n_all for k, s in sums.items()})
+        for r, lat_r in val_res.items():  # --multi-res: the lower resolutions (same captions, LM states, t, noise)
+            side = r // 16
+            cos, sin = build_rope_2d(side, den_cfg.dim // den_cfg.heads, den_cfg.rope_ref)
+            den_eval.rope_cos, den_eval.rope_sin = cos.to(device), sin.to(device)
+            got = evaluate(te, den_eval, (lat_r, val[1]), device, lm_states=val_lm, groups=val_shard_groups,
+                           den_chunk=max(1, 16384 // side ** 2))
+            res.update({f"val_{r}px/" + k.split("/", 1)[1] if k.startswith("val/")
+                        else k.replace("val_", f"val_{r}px_", 1): x for k, x in got.items()})
         torch._foreach_copy_(list(te.parameters()), te_live)
         del den_eval
         if device.type == "cuda":
