@@ -172,6 +172,11 @@ def get_args():
                    help="--opd: the --lm-rank server(s) also host klein (needs --klein-quant) and take a share of the "
                         "states like the --teacher-ranks; that GPU is otherwise ~99%% idle during --opd")
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--opd: Euler steps of the student's trajectories")
+    p.add_argument("--opd-query", choices=["uniform", "beta52"], default="uniform",
+                   help="--opd: which rollout states the teacher scores: uniform = --opd-states distinct steps at random "
+                        "(DiffusionOPD-like; all of them with --opd-states = --opd-rollout-steps); beta52 = DanceOPD "
+                        "(arXiv 2606.27377): u ~ Beta(5, 2) over the trajectory (noise -> clean), step min(floor(u K), K-1), "
+                        "low-noise biased, with --opd-states 1")
     p.add_argument("--opd-states", type=int, default=4,
                    help="--opd: states per trajectory (distinct random steps) the teacher scores and the student trains on")
     p.add_argument("--dist-timeout", type=float, default=120,
@@ -724,7 +729,11 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     from aurora.klein import tokenize
     B, m, K = eps.shape[0], args.opd_states, args.opd_rollout_steps
     g = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + step + 7)
-    picks = torch.stack([torch.randperm(K, generator=g)[:m] for _ in range(B)])  # distinct steps per trajectory
+    if args.opd_query == "beta52":  # DanceOPD: Beta(5, 2) over the normalised trajectory, biased to the clean end
+        u = np.random.default_rng([args.seed, replica, step, 52]).beta(5.0, 2.0, size=(B, m))
+        picks = torch.from_numpy((u * K).astype(np.int64)).clamp(max=K - 1)
+    else:
+        picks = torch.stack([torch.randperm(K, generator=g)[:m] for _ in range(B)])  # distinct steps per trajectory
     # the grid's inner points shifted by a random fraction of a step every training step: the trained t cover [0, 1]
     # instead of K fixed values (the trajectories still start at pure noise and end at t = 0)
     d = torch.rand((), generator=g).item()
