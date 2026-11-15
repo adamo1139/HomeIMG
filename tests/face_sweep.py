@@ -1,4 +1,4 @@
-"""Faces side by side for several models (e.g. before / after --opd): rows = models, columns = prompts, one grid per
+"""Faces side by side for several models (e.g. before / after OPD): rows = models, columns = prompts, one grid per
 seed; every model gets the same prompts and noise. Models load one at a time (fits a 16 GB GPU).
 
   python tests/face_sweep.py --models cpral/HomeIMG-1.2B-PL-EN-epoch22:3 cpral/HomeIMG-1.2B-PL-EN-epoch22-OPD300:1 \\

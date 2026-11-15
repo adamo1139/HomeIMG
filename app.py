@@ -43,7 +43,7 @@ def main():
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--cfg", type=float, default=3.0,
-                   help="default CFG slider value; 1 for guidance-distilled models (train_pp.py --opd)")
+                   help="default CFG slider value; 1 for guidance-distilled models (train_pp.py --diffusion-opd / --dance-opd)")
     args = p.parse_args()
 
     device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"

@@ -152,33 +152,33 @@ def get_args():
     p.add_argument("--t-shift", type=float, default=1.0,
                    help="timestep shift s, t -> s t / (1 + (s - 1) t) after t = sigmoid(randn); 1 = none. SD3's "
                         "resolution rule would be sqrt(tokens / 256): 0.25 at 64 px, 0.5 at 128, 2 at 512, 4 at 1024")
-    p.add_argument("--opd", action="store_true",
+    p.add_argument("--diffusion-opd", action="store_true",
                    help="on-policy distillation from FLUX.2 klein base (DiffusionOPD, arXiv:2605.15055) instead of flow "
                         "matching on the data, --pp 1 only: each step the student samples its own Euler trajectories "
-                        "(conditional velocity, no CFG) from noise for the batch's captions, --opd-states states per "
-                        "trajectory are sent to a teacher rank, and the student's velocity there is regressed onto "
-                        "klein's CFG-guided one. The teacher always gets the ENGLISH original of the caption the student "
-                        "sees (Polish or English). The student becomes guidance-distilled: sample it with CFG 1")
+                        "(conditional velocity, no CFG) from noise for the batch's captions, --opd-states (default 4) "
+                        "distinct random states per trajectory are sent to a teacher rank, and the student's velocity "
+                        "there is regressed onto klein's CFG-guided one. The teacher always gets the ENGLISH original of "
+                        "the caption the student sees (Polish or English). The student becomes guidance-distilled: "
+                        "sample it with CFG 1")
+    p.add_argument("--dance-opd", action="store_true",
+                   help="as --diffusion-opd, but DanceOPD (arXiv:2606.27377): --opd-states (default 1) states per "
+                        "trajectory at step min(floor(u K), K - 1), u ~ Beta(5, 2) over the trajectory (noise -> clean), "
+                        "i.e. low-noise states")
     p.add_argument("--teacher-ranks", type=int, default=0,
-                   help="--opd: ranks holding klein (transformer + Qwen3 text encoder, ~17 GB in bf16), placed after the "
+                   help="--diffusion-opd / --dance-opd: ranks holding klein (transformer + Qwen3 text encoder, ~17 GB in bf16), placed after the "
                         "training ranks and before the --lm-rank ones; every training rank splits its trajectories "
                         "over all of them")
-    p.add_argument("--klein", default="black-forest-labs/FLUX.2-klein-base-4B", help="--opd: klein base repo or dir")
-    p.add_argument("--opd-cfg", type=float, default=4.0, help="--opd: the teacher's CFG scale (klein base: 4)")
+    p.add_argument("--klein", default="black-forest-labs/FLUX.2-klein-base-4B", help="--diffusion-opd / --dance-opd: klein base repo or dir")
+    p.add_argument("--opd-cfg", type=float, default=4.0, help="--diffusion-opd / --dance-opd: the teacher's CFG scale (klein base: 4)")
     p.add_argument("--klein-quant", default="", choices=["", "int8", "fp8"],
-                   help="--opd: teacher linear weights in 8 bits (aurora/klein.py QLinear; ~8 GB instead of ~16, bf16 "
+                   help="--diffusion-opd / --dance-opd: teacher linear weights in 8 bits (aurora/klein.py QLinear; ~8 GB instead of ~16, bf16 "
                         "matmuls). int8 (one scale per 128 inputs) is ~3x more accurate than fp8")
     p.add_argument("--teacher-on-lm", action="store_true",
-                   help="--opd: the --lm-rank server(s) also host klein (needs --klein-quant) and take a share of the "
-                        "states like the --teacher-ranks; that GPU is otherwise ~99%% idle during --opd")
-    p.add_argument("--opd-rollout-steps", type=int, default=16, help="--opd: Euler steps of the student's trajectories")
-    p.add_argument("--opd-query", choices=["uniform", "beta52"], default="uniform",
-                   help="--opd: which rollout states the teacher scores: uniform = --opd-states distinct steps at random "
-                        "(DiffusionOPD-like; all of them with --opd-states = --opd-rollout-steps); beta52 = DanceOPD "
-                        "(arXiv 2606.27377): u ~ Beta(5, 2) over the trajectory (noise -> clean), step min(floor(u K), K-1), "
-                        "low-noise biased, with --opd-states 1")
-    p.add_argument("--opd-states", type=int, default=4,
-                   help="--opd: states per trajectory (distinct random steps) the teacher scores and the student trains on")
+                   help="--diffusion-opd / --dance-opd: the --lm-rank server(s) also host klein (needs --klein-quant) and take a share of the "
+                        "states like the --teacher-ranks; that GPU is otherwise ~99%% idle during OPD")
+    p.add_argument("--opd-rollout-steps", type=int, default=16, help="--diffusion-opd / --dance-opd: Euler steps of the student's trajectories")
+    p.add_argument("--opd-states", type=int, default=None,
+                   help="--diffusion-opd / --dance-opd: states per trajectory (distinct random steps) the teacher scores and the student trains on")
     p.add_argument("--dist-timeout", type=float, default=120,
                    help="minutes a collective / p2p op may wait for the other ranks (evals at 1024 px take ~10 min)")
     p.add_argument("--skip-gpus", type=int, nargs="*", default=[],
@@ -283,7 +283,7 @@ class Stage(nn.Module):
         self.register_buffer("rope_sin", sin, persistent=False)
         self.repa_targets, self.repa_losses, self._mb = None, [], 0
         self.lm_states = None  # frozen-LM hidden states per micro-batch, computed on all stages (see main)
-        self.text_cache = None  # (text, valid) to use instead of running the text encoder (--opd rollouts)
+        self.text_cache = None  # (text, valid) to use instead of running the text encoder (OPD rollouts)
         # per micro-batch (local_train_step): (B, 8) micro-conditions (None: whole images) and (cos, sin) of random
         # RPE-2D positions (None: the even grid in the buffers)
         self.mb_cond, self.mb_rope = None, None
@@ -522,7 +522,7 @@ def lm_server(te_cfg, clients, device, log, control_group, lm=None, teacher=None
         lm = LMTextEncoder(te_cfg).to(device).lm if lm is None else lm
     if packed:
         enable_packed(lm, compile=True)
-    log(f"LM server: {te_cfg.repo} for ranks {clients}{' (+ the --opd teacher)' if teacher else ''}" if serve_lm
+    log(f"LM server: {te_cfg.repo} for ranks {clients}{' (+ the OPD teacher)' if teacher else ''}" if serve_lm
         else f"VAE server (rank {dist.get_rank()}) for ranks {clients}", flush=True)
     # one stop per LM client, and one per teacher client when this rank also serves klein (--teacher-on-lm: every
     # training rank, not only this server's LM clients)
@@ -723,13 +723,13 @@ def opd_rollout(stage, z, ids, lm_states, mb, ts, picks, widths=None):
 
 
 def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses, parts=2):
-    """One --opd step for this replica's batch (see --opd). The batch is cut into `parts`: part p+1 is rolled out
+    """One OPD step for this replica's batch (see --diffusion-opd / --dance-opd). The batch is cut into `parts`: part p+1 is rolled out
     (and later trained on) while the teachers score part p, so neither side waits for the other; all parts use
     this step's weights, so it stays on-policy."""
     from aurora.klein import tokenize
     B, m, K = eps.shape[0], args.opd_states, args.opd_rollout_steps
     g = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + step + 7)
-    if args.opd_query == "beta52":  # DanceOPD: Beta(5, 2) over the normalised trajectory, biased to the clean end
+    if args.dance_opd:  # DanceOPD: Beta(5, 2) over the normalised trajectory, biased to the clean end
         u = np.random.default_rng([args.seed, replica, step, 52]).beta(5.0, 2.0, size=(B, m))
         picks = torch.from_numpy((u * K).astype(np.int64)).clamp(max=K - 1)
     else:
@@ -744,7 +744,7 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     lm_full = torch.cat(states) if states is not None else None  # (B, L, H)
     per = -(-B // parts)
     assert (per * m) % mb == 0 or parts == 1, \
-        f"--opd: {per} trajectories x {m} states must split into micro-batches of {mb}"
+        f"OPD: {per} trajectories x {m} states must split into micro-batches of {mb}"
     rep = lambda a: a.repeat_interleave(m, dim=0)
     pending = []
     for b0 in range(0, B, per):  # roll out every part and send it; the teachers start on part 0 at once
@@ -814,13 +814,17 @@ def load_val_cached(root, names, n, tok_suffix, null_row, lat_kind, lat_root, im
 
 def main():
     args = resolve_defaults(get_args())
+    assert not (args.diffusion_opd and args.dance_opd), "--diffusion-opd or --dance-opd, not both"
+    args.opd = args.diffusion_opd or args.dance_opd  # the on-policy distillation path (opd_step) for either
+    if args.opd_states is None:
+        args.opd_states = 1 if args.dance_opd else 4
     # long timeout: at 1024 px the held-out encoding / LM states and every eval take ~10 min on rank 0 while the
     # others wait (the default 10 min killed the first 1024 px run)
     dist_to = datetime.timedelta(minutes=args.dist_timeout)  # also given to every new_group (they don't inherit it)
     dist.init_process_group(os.environ.get("DIST_BACKEND", "nccl"), timeout=dist_to)
     rank, world_all = dist.get_rank(), dist.get_world_size()
     pp = args.pp
-    # training ranks first, then --teacher-ranks (klein, --opd), then the --lm-rank LM servers, then the --vae-rank
+    # training ranks first, then --teacher-ranks (klein, OPD), then the --lm-rank LM servers, then the --vae-rank
     world = world_all - args.lm_rank - args.teacher_ranks - args.vae_rank
     lm_servers = list(range(world + args.teacher_ranks, world_all - args.vae_rank))
     vae_servers = list(range(world_all - args.vae_rank, world_all))
@@ -880,7 +884,7 @@ def main():
             "--multi-res, --multi-res-mbs and --multi-res-mb need one value per resolution"
         assert pp == 1 and args.img_dir and max(args.multi_res) == args.res and all(r % 16 == 0 for r in args.multi_res), \
             "--multi-res needs --pp 1, --img-dir and --res = the largest resolution (multiples of 16)"
-        assert args.repa_weight == 0 and not args.opd and not args.crop_res, "--multi-res: no REPA / --opd / --crop-res"
+        assert args.repa_weight == 0 and not args.opd and not args.crop_res, "--multi-res: no REPA / OPD / --crop-res"
         per_mr = sum(n * k for _, n, k in mr_groups)
         assert args.batch == replicas * per_mr, \
             f"--multi-res: {per_mr} images per replica and step, so --batch must be {replicas * per_mr}"
@@ -902,9 +906,9 @@ def main():
     assert args.res % 16 == 0, "--res must be a multiple of 16 (one latent token per 16 px)"
     den_cfg = replace(den_cfg, latent_size=args.res // 16, rope_ref=args.rope_ref, micro_cond=args.micro_cond)
     assert not args.rope_random or (args.rope_ref >= args.res // 16 and not args.opd), \
-        "--rope-random needs --rope-ref >= the grid side (the field to sample from), no --opd"
+        "--rope-random needs --rope-ref >= the grid side (the field to sample from), no OPD"
     assert not args.crop_res or (args.micro_cond and pp == 1 and not args.opd), \
-        "--crop-res needs --micro-cond, --pp 1, no --opd"
+        "--crop-res needs --micro-cond, --pp 1, no OPD"
     assert all(r > args.res for r in args.crop_res), "--crop-res must be larger than --res"
     assert not (args.img_dir and args.crop_res), "--crop-res crops stored latents; not with --img-dir"
     assert args.img_dir or not args.img_extra, "--img-extra needs --img-dir"
@@ -930,7 +934,7 @@ def main():
             f"--init denoiser {old} differs from {den_cfg} in more than the depth / resolution"
         assert old_depth <= den_cfg.depth, f"--init has {old_depth} blocks, more than --depth {den_cfg.depth}"
     if args.opd:
-        assert pp == 1 and teachers, "--opd needs --pp 1 and --teacher-ranks (or --teacher-on-lm)"
+        assert pp == 1 and teachers, "--diffusion-opd / --dance-opd need --pp 1 and --teacher-ranks (or --teacher-on-lm)"
         assert not args.teacher_on_lm or (args.lm_rank and args.klein_quant), \
             "--teacher-on-lm needs --lm-rank and --klein-quant (klein in bf16 does not fit next to the LM)"
         args.cfg_drop = 0.0  # the target is the teacher's guided velocity for the caption; no null-prompt branch
@@ -1147,7 +1151,7 @@ def main():
                 blk.compile(dynamic=False)
         if first:
             te.compile(dynamic=False)
-            # one graph per text width bucket and batch size (training, --opd rollout parts, evaluation chunks):
+            # one graph per text width bucket and batch size (training, OPD rollout parts, evaluation chunks):
             # more than dynamo's default 8, which would leave the rest eager
             torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
     hf_lm = getattr(te_cfg, "backend", "") == "hf"  # remote code + MoE routing: runs eager (see aurora/slayer.py)
@@ -1294,7 +1298,7 @@ def main():
         from aurora.klein import TeacherClient, tokenizer as klein_tokenizer
         teacher_client = TeacherClient(teachers, device, control_group, shared=lm_servers if args.teacher_on_lm else ())
         qwen_tok, captions_en = klein_tokenizer(args.klein), CaptionText(args.data, train_names)
-        log(f"--opd: teacher {args.klein} on ranks {teachers} (CFG {args.opd_cfg}), {args.opd_rollout_steps}-step student "
+        log(f"{'--dance-opd' if args.dance_opd else '--diffusion-opd'}: teacher {args.klein} on ranks {teachers} (CFG {args.opd_cfg}), {args.opd_rollout_steps}-step student "
             f"trajectories, {args.opd_states} states each, {args.batch * args.opd_states} states per step")
     if lm_client is not None and master and val_names:  # held-out LM states once (one request: see lm_server)
         ids_val = val[1].to(device)
