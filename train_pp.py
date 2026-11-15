@@ -164,6 +164,9 @@ def get_args():
                    help="as --diffusion-opd, but DanceOPD (arXiv:2606.27377): --opd-states (default 1) states per "
                         "trajectory at step min(floor(u K), K - 1), u ~ Beta(5, 2) over the trajectory (noise -> clean), "
                         "i.e. low-noise states")
+    p.add_argument("--dance-beta", type=float, nargs=2, default=[5.0, 2.0], metavar=("A", "B"),
+                   help="--dance-opd: the Beta(A, B) of the queried state's position on the trajectory (0 = noise, 1 = "
+                        "clean); 5 2 = the paper's low-noise bias, 2 5 = mostly the high-noise (composition) steps")
     p.add_argument("--teacher-ranks", type=int, default=0,
                    help="--diffusion-opd / --dance-opd: ranks holding klein (transformer + Qwen3 text encoder, ~17 GB in bf16), placed after the "
                         "training ranks and before the --lm-rank ones; every training rank splits its trajectories "
@@ -729,8 +732,8 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     from aurora.klein import tokenize
     B, m, K = eps.shape[0], args.opd_states, args.opd_rollout_steps
     g = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + step + 7)
-    if args.dance_opd:  # DanceOPD: Beta(5, 2) over the normalised trajectory, biased to the clean end
-        u = np.random.default_rng([args.seed, replica, step, 52]).beta(5.0, 2.0, size=(B, m))
+    if args.dance_opd:  # DanceOPD: Beta(A, B) (--dance-beta, the paper's 5 2) over the normalised trajectory
+        u = np.random.default_rng([args.seed, replica, step, 52]).beta(*args.dance_beta, size=(B, m))
         picks = torch.from_numpy((u * K).astype(np.int64)).clamp(max=K - 1)
     else:
         picks = torch.stack([torch.randperm(K, generator=g)[:m] for _ in range(B)])  # distinct steps per trajectory
