@@ -196,6 +196,8 @@ def get_args():
                    help="replay: bounded 0.5..1.5 weights from previous-update MSE within four t bins; needs reuse > 1")
     p.add_argument("--opd-reuse", type=int, default=1,
                    help="optimizer updates per cached OPD batch, including the fresh update; 1 disables replay")
+    p.add_argument("--keep-ckpt-steps", type=int, nargs="*", default=[],
+                   help="also keep weights and EMA as step_NNNNNNN.pt at these updates (optimizer stays in latest files)")
     p.add_argument("--opd-parts", type=int, default=2,
                    help="OPD rollout chunks per replica: pipeline teacher requests and backward; default 2, try 4")
     p.add_argument("--opd-states", type=int, default=None,
@@ -1609,6 +1611,11 @@ def main():
             os.replace(opt_path + ".tmp", opt_path)
         if master:
             os.replace(ckpt_path + ".tmp", ckpt_path)
+            if step in args.keep_ckpt_steps:
+                # latest.pt is replaced atomically on future saves, so this inode remains intact.
+                kept_path = os.path.join(args.out, f"step_{step:07d}.pt")
+                os.link(ckpt_path, kept_path + ".tmp")
+                os.replace(kept_path + ".tmp", kept_path)
 
     @torch.no_grad()
     def ema_eval():
@@ -2179,7 +2186,7 @@ def main():
         profile.end_step(step)
         if args.bench:
             continue
-        if step % args.ckpt_every == 0 or step == args.steps:  # before the eval: an eval that fails loses no steps
+        if step % args.ckpt_every == 0 or step == args.steps or step in args.keep_ckpt_steps:
             save()
         if args.eval_every > 0 and (step % args.eval_every == 0 or step == args.steps):
             res = ema_eval()
