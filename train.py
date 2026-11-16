@@ -147,7 +147,7 @@ def build_parser():
     p.add_argument("--workers", type=int, default=4, help="DataLoader workers per GPU")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=None, help="default: steps / 40, at most 100")
-    p.add_argument("--eval-every", type=int, default=None, help="default: steps / 20")
+    p.add_argument("--eval-every", type=int, default=None, help="default: steps / 20; 0 disables evaluation, including the final step")
     p.add_argument("--ckpt-every", type=int, default=None,
                    help="overwrite <out>/latest.pt (full state, for resuming); default: steps / 50")
     p.add_argument("--merge-every", type=int, default=None,
@@ -1005,7 +1005,7 @@ def main():
             acc.zero_()
             t0, t_last = time.time(), step
 
-        if val is not None and (step % args.eval_every == 0 or step == args.steps):
+        if val is not None and args.eval_every > 0 and (step % args.eval_every == 0 or step == args.steps):
             res = ema_eval()
             log(f"step {step:>7} | EMA " + " ".join(f"{k}={v:.4f}" for k, v in res.items()), flush=True)
             if wb:
@@ -1030,7 +1030,7 @@ def main():
         if master and args.merge_every and step >= args.merge_start * args.steps and (
                 step % args.merge_every == 0 or step == args.steps):
             save_merge()
-        if distributed and (step % args.eval_every == 0 or step % args.ckpt_every == 0
+        if distributed and ((args.eval_every > 0 and step % args.eval_every == 0) or step % args.ckpt_every == 0
                             or (args.keep_every and step % args.keep_every == 0)):
             dist.barrier()
 

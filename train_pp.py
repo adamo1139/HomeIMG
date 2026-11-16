@@ -1857,7 +1857,7 @@ def main():
             continue
         if step % args.ckpt_every == 0 or step == args.steps:  # before the eval: an eval that fails loses no steps
             save()
-        if step % args.eval_every == 0 or step == args.steps:
+        if args.eval_every > 0 and (step % args.eval_every == 0 or step == args.steps):
             res = ema_eval()
             if master and res is not None:
                 log(f"step {step:>7} | EMA " + " ".join(f"{k}={v:.4f}" for k, v in res.items()), flush=True)
