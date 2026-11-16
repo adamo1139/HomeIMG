@@ -69,13 +69,13 @@ print('Replay: 8 AdamW updates match independent recomputation exactly, includin
 main=next(n for n in ast.parse(source).body if getattr(n,'name','')=='main')
 loop=next(n for n in main.body if isinstance(n,ast.While))
 a=next(i for i,n in enumerate(loop.body) if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='replay' for t in n.targets))
-code=compile(ast.Module(body=loop.body[a:a+2],type_ignores=[]),'<main-data-gate>','exec')
+code=compile(ast.Module(body=loop.body[a:a+4],type_ignores=[]),'<main-data-gate>','exec')
 for resume in (0,5,8):
     calls=[]
     def batch(step):
         calls.append(step)
         return torch.zeros(1),None,None,None,None,None,None,None
-    env=dict(args=SimpleNamespace(opd=True,opd_reuse=8),opd_cache={},opd_pass=0,
+    env=dict(args=SimpleNamespace(opd=True,opd_reuse=8),opd_next=None,opd_cache={},opd_pass=0,
              lm_client=None,next_batch=batch,stage_mod=SimpleNamespace(lm_states=None),lm_offload=False,
              torch=torch,opd_batches=3)
     for step in range(resume,resume+16):

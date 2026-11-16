@@ -180,6 +180,8 @@ def get_args():
                    help="--diffusion-opd / --dance-opd: the --lm-rank server(s) also host klein (needs --klein-quant) and take a share of the "
                         "states like the --teacher-ranks; that GPU is otherwise ~99%% idle during OPD")
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--diffusion-opd / --dance-opd: Euler steps of the student's trajectories")
+    p.add_argument("--opd-prefetch", action="store_true",
+                   help="prepare one future OPD cache during replay; needs reuse > 1 and an LM server; rollouts are stale")
     p.add_argument("--opd-state-weighting", action="store_true",
                    help="replay: bounded 0.5..1.5 weights from previous-update MSE within four t bins; needs reuse > 1")
     p.add_argument("--opd-reuse", type=int, default=1,
@@ -742,10 +744,11 @@ def opd_rollout(stage, z, ids, lm_states, mb, ts, picks, widths=None):
     return out
 
 
-def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses, parts=2, cache=None):
+def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses, parts=2, cache=None, prepare_only=False):
     """One OPD step for this replica's batch (see --diffusion-opd / --dance-opd). The batch is cut into `parts`: part p+1 is rolled out
     (and later trained on) while the teachers score part p, to overlap teacher work with rollout and backward; all parts use
     this step's weights, so it stays on-policy."""
+    assert not prepare_only or cache is not None, "prepare-only needs a cache"
     from aurora.klein import tokenize
     B, m, K = eps.shape[0], args.opd_states, args.opd_rollout_steps
     g = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + step + 7)
@@ -770,7 +773,7 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
         cache.clear()
         cache.update(ids=ids.detach(), ids_cpu=None if ids_cpu is None else ids_cpu.detach(),
                      lm=None if lm_full is None else lm_full.detach(), m=m, chunks=[],
-                     weighting=getattr(args, "opd_state_weighting", False), errors=[])
+                     weighting=getattr(args, "opd_state_weighting", False), errors=[], pending=[])
     rep = lambda a: a.repeat_interleave(m, dim=0)
     def train_part(item):
         b0, b1, x, t, h = item
@@ -804,13 +807,18 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
             current = (b0, b1, x, t, teacher.request(q_ids[b0:b1], q_mask[b0:b1], x, t, cap))
             # Teacher scores current while the student backpropagates the previous chunk.
             # No optimizer update occurs here: all rollouts use this step's weights.
-            if pending is not None:
-                count += train_part(pending)
-            pending = current
+            if prepare_only:
+                cache["pending"].append(current)  # keep NCCL buffers and handles alive until collection
+            else:
+                if pending is not None:
+                    count += train_part(pending)
+                pending = current
         if pending is not None:
             count += train_part(pending)
     finally:
         stage.lm_states = states
+    if prepare_only:
+        return
     grads = [p.grad for p in stage.parameters() if p.grad is not None]
     torch._foreach_div_(grads, count)
 
@@ -845,7 +853,7 @@ def opd_replay(stage, cache, mb, losses, text_bucket=False):
     count = 0
     m = cache["m"]
     weighted = cache.get("weighting", False)
-    weights = opd_state_weights(torch.cat(cache["errors"]), torch.cat([c[3] for c in cache["chunks"]])) if weighted else None
+    weights = opd_state_weights(torch.cat(cache["errors"]), torch.cat([c[3] for c in cache["chunks"]])) if weighted and cache["errors"] else None
     # New errors become priorities only on the NEXT update; no extra forward and no retained graph.
     errors, offset = [], 0
     if weights is not None:
@@ -872,6 +880,14 @@ def opd_replay(stage, cache, mb, losses, text_bucket=False):
         stage.lm_states = states
     grads = [p.grad for p in stage.parameters() if p.grad is not None]
     torch._foreach_div_(grads, count)
+
+
+def opd_collect_prepared(teacher, cache):
+    """Finish outstanding requests without retaining communication buffers in the replay cache."""
+    pending = cache.pop("pending")
+    for b0, b1, x, t, handle in pending:
+        target = teacher.collect(handle)
+        cache["chunks"].append((b0, b1, x.detach(), t.detach(), target.detach()))
 
 
 def owned_den_names(den, s, pp, ranges):
@@ -921,6 +937,7 @@ def main():
     assert args.opd_reuse >= 1, "--opd-reuse must be >= 1"
     assert args.opd or args.opd_reuse == 1, "--opd-reuse needs OPD"
     assert not args.opd_state_weighting or (args.opd and args.opd_reuse > 1), "--opd-state-weighting needs OPD reuse > 1"
+    assert not args.opd_prefetch or (args.opd and args.opd_reuse > 1 and args.lm_rank > 0), "--opd-prefetch needs OPD reuse > 1 and --lm-rank"
     if args.opd_states is None:
         args.opd_states = 1 if args.dance_opd else 4
     # long timeout: at 1024 px the held-out encoding / LM states and every eval take ~10 min on rank 0 while the
@@ -1408,7 +1425,7 @@ def main():
         log(f"{'--dance-opd' if args.dance_opd else '--diffusion-opd'}: teacher {args.klein} on ranks {teachers} (CFG {args.opd_cfg}), {args.opd_rollout_steps}-step student "
             f"trajectories, {args.opd_states} states each, {args.batch * args.opd_states} states per update; "
             f"reuse {args.opd_reuse} updates per fresh batch (cache refreshed after resume); "
-            f"state weighting {args.opd_state_weighting}")
+            f"state weighting {args.opd_state_weighting}; next-batch prefetch {args.opd_prefetch}")
     if lm_client is not None and master and val_names:  # held-out LM states once (one request: see lm_server)
         ids_val = val[1].to(device)
         h = lm_client.request(val[1])
@@ -1701,6 +1718,7 @@ def main():
                                                                "te_config": asdict(te_cfg), "rank": rank})
     opt_window = []  # keep every step in the logging window, including cheap periodic-Muon steps
     opd_cache, opd_pass = {}, 0
+    opd_next = None  # one-batch lookahead; not checkpointed or counted as consumed until trained
     opd_acc = torch.zeros(4, device=device)  # fresh loss/count, replay loss/count
     pending = None  # --lm-rank: the next step's batch and its LM request, sent while the current step trains
     # all training ranks enter step 1 together: stages without data / validation work would otherwise start the
@@ -1709,7 +1727,12 @@ def main():
     while step < args.steps:
         profile.begin_step(step + 1)
         replay = args.opd and bool(opd_cache) and opd_pass < args.opd_reuse
-        if not replay:
+        prepared = not replay and opd_next is not None
+        if prepared:
+            opd_cache.clear()
+            opd_cache, opd_next, opd_pass = opd_next, None, 0
+            opd_batches += 1
+        if not replay and not prepared:
             opd_cache.clear()  # release old latent targets before generating the next batch
             opd_pass = 0
             if lm_client is not None:
@@ -1776,6 +1799,25 @@ def main():
                 stage_mod.lm_states = gather_to_stage(mine, M, s, pp, 0, replica * pp)
             if args.opd:
                 opd_batches += 1
+        if args.opd_prefetch and replay and opd_next is None and step + args.opd_reuse - opd_pass < args.steps:
+            # Prepare next-cycle states after the current cache's first optimizer update.
+            # No new optimizer steps here; the teacher can score these during remaining replay updates.
+            saved_states = stage_mod.lm_states
+            future_step = step + args.opd_reuse - opd_pass
+            with profile.phase("opd_prefetch"):
+                nb = next_batch(future_step)
+                request = lm_client.request(nb[5])
+                future_lm = lm_client.collect(request)
+                stage_mod.lm_states = [future_lm[k * mb:(k + 1) * mb] for k in range(M)]
+                opd_next = {}
+                try:
+                    with amp:
+                        opd_step(stage_mod, teacher_client, qwen_tok, captions_en(nb[6].tolist()), nb[3], nb[4],
+                                 nb[5], mb, args, future_step, replica, [], parts=args.opd_parts,
+                                 cache=opd_next, prepare_only=True)
+                finally:
+                    stage_mod.lm_states = saved_states
+                del nb, request, future_lm, saved_states
         stage_mod.repa_targets = None
         if step < repa_steps and step % args.repa_every == 0:
             n_repa = max(1, round(args.repa_frac * mb))
@@ -1798,7 +1840,10 @@ def main():
                     dist.recv(x0, src=replica * pp, group=x0_groups[replica])
             try:
                 with amp:
-                    if replay:
+                    if prepared:
+                        opd_collect_prepared(teacher_client, opd_cache)
+                        opd_replay(stage_mod, opd_cache, mb, losses, args.text_bucket)
+                    elif replay:
                         opd_replay(stage_mod, opd_cache, mb, losses, args.text_bucket)
                     elif first and isinstance(x0, list):  # --multi-res: one local_train_step per resolution group
                         count = 0
@@ -1970,7 +2015,7 @@ def main():
             if peak:
                 stats["mfu"] = stats["tflops_per_gpu"] / peak
                 mfu = f" MFU {stats['mfu']:.0%}"
-            opd_s = f" | OPD {'replay' if replay else 'fresh'} {opd_pass}/{args.opd_reuse}" if args.opd else ""
+            opd_s = f" | OPD {'replay' if replay else 'prefetched' if prepared else 'fresh'} {opd_pass}/{args.opd_reuse}" if args.opd else ""
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | {repa_s}grad_norm {stats['train/grad_norm']:.3f} | "
                 f"{f'lr x{mult:.3f} | ' if mult != 1.0 else ''}{stats['imgs_per_s']:.0f} img/s | "
                 f"~{stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | opt avg {opt_ms:.0f} ms | eta {(args.steps - step) / stats['steps_per_s'] / 3600:.1f} h{mem_s}{opd_s} | {dt / n:.2f} s/update",
