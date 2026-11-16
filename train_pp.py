@@ -180,6 +180,8 @@ def get_args():
                    help="--diffusion-opd / --dance-opd: the --lm-rank server(s) also host klein (needs --klein-quant) and take a share of the "
                         "states like the --teacher-ranks; that GPU is otherwise ~99%% idle during OPD")
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--diffusion-opd / --dance-opd: Euler steps of the student's trajectories")
+    p.add_argument("--opd-state-weighting", action="store_true",
+                   help="replay: bounded 0.5..1.5 weights from previous-update MSE within four t bins; needs reuse > 1")
     p.add_argument("--opd-reuse", type=int, default=1,
                    help="optimizer updates per cached OPD batch, including the fresh update; 1 disables replay")
     p.add_argument("--opd-parts", type=int, default=2,
@@ -665,7 +667,7 @@ def text_widths(ids_cpu, microbatch, multiple=64):
 
 
 def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None, divide=True, cond=None,
-                     rope_field=0, rope_seed=None):
+                     rope_field=0, rope_seed=None, sample_weights=None, state_errors=None):
     """PP=1: immediate backward, no pipeline output retention, variable text widths per microbatch. divide=False:
     leave the summed gradients (the caller divides once after several calls) and return the micro-batch count.
     cond: (B, 8) micro-conditions; rope_field > 0: random RPE-2D positions of 0 .. rope_field - 1 (microbatch_rope)."""
@@ -683,8 +685,15 @@ def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None, 
                 stage.lm_states = [None] * count
                 stage.lm_states[k] = states[k][:, :width]
             pred = stage(z[sl], t[sl], ids[sl, :width])
-            loss = F.mse_loss(pred.float(), target[sl])
-            losses.append(loss.detach())
+            if sample_weights is not None or state_errors is not None:
+                per_state = (pred.float() - target[sl]).square().flatten(1).mean(1)
+                if state_errors is not None:
+                    state_errors.append(per_state.detach())
+                raw_loss = per_state.mean()
+                loss = (per_state * sample_weights[sl].detach()).mean() if sample_weights is not None else raw_loss
+            else:
+                loss = raw_loss = F.mse_loss(pred.float(), target[sl])
+            losses.append(raw_loss.detach())  # comparable unweighted MSE, including weighted replay
             # AddAux's auxiliary gradient is 1; divide ALL accumulated gradients after backward,
             # matching Schedule1F1B.perform_reduce_grad, including REPA.
             loss.backward()
@@ -760,7 +769,8 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     if cache is not None:
         cache.clear()
         cache.update(ids=ids.detach(), ids_cpu=None if ids_cpu is None else ids_cpu.detach(),
-                     lm=None if lm_full is None else lm_full.detach(), m=m, chunks=[])
+                     lm=None if lm_full is None else lm_full.detach(), m=m, chunks=[],
+                     weighting=getattr(args, "opd_state_weighting", False), errors=[])
     rep = lambda a: a.repeat_interleave(m, dim=0)
     def train_part(item):
         b0, b1, x, t, h = item
@@ -774,7 +784,8 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
             cache["chunks"].append((b0, b1, x.detach(), t.detach(), target.detach()))
         try:
             return local_train_step(stage, x, t, rep(ids[b0:b1]), target, mb, losses, w_rep,
-                                    divide=False)
+                                    divide=False,
+                                    state_errors=cache["errors"] if cache is not None and cache["weighting"] else None)
         finally:
             stage.lm_states = states
 
@@ -804,11 +815,41 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     torch._foreach_div_(grads, count)
 
 
+@torch.no_grad()
+def opd_state_weights(errors, times):
+    """Local batch priorities from the PREVIOUS update; preserve each time bin's total loss weight.
+    Four physical-t bins. Median ties stay neutral; fewer than four states stay uniform.
+    Balance positive/negative deviations so weights have mean 1 and remain in [0.5, 1.5].
+    """
+    errors, times = errors.detach().float(), times.detach().float()
+    weights = torch.ones_like(errors)
+    bins = (times * 4).long().clamp(0, 3)
+    for b in range(4):
+        idx = (bins == b).nonzero(as_tuple=True)[0]
+        if idx.numel() < 4:
+            continue
+        e = errors[idx]
+        if not torch.isfinite(e).all():
+            continue
+        median = e.quantile(0.5)
+        low, high = e < median, e > median
+        nl, nh = low.sum().float(), high.sum().float()
+        denom = torch.maximum(nl, nh).clamp_min(1)
+        weights[idx] = 1 + 0.5 * (high.float() * nl - low.float() * nh) / denom
+    return weights
+
+
 def opd_replay(stage, cache, mb, losses, text_bucket=False):
     """One new backward on detached teacher targets; never cache trainable text features or graphs."""
     states = stage.lm_states
     count = 0
     m = cache["m"]
+    weighted = cache.get("weighting", False)
+    weights = opd_state_weights(torch.cat(cache["errors"]), torch.cat([c[3] for c in cache["chunks"]])) if weighted else None
+    # New errors become priorities only on the NEXT update; no extra forward and no retained graph.
+    errors, offset = [], 0
+    if weights is not None:
+        cache["last_weights"] = weights
     rep = lambda a: a.repeat_interleave(m, dim=0)
     try:
         for b0, b1, x, t, target in cache["chunks"]:
@@ -821,7 +862,12 @@ def opd_replay(stage, cache, mb, losses, text_bucket=False):
             cpu = cache["ids_cpu"]
             widths = text_widths(rep(cpu[b0:b1]), mb, text_bucket) if cpu is not None and text_bucket else None
             count += local_train_step(stage, x, t, rep(cache["ids"][b0:b1]), target, mb, losses, widths,
-                                      divide=False)
+                                      divide=False,
+                                      sample_weights=None if weights is None else weights[offset:offset + len(x)],
+                                      state_errors=errors if weighted else None)
+            offset += len(x)
+        if weighted:
+            cache["errors"] = errors
     finally:
         stage.lm_states = states
     grads = [p.grad for p in stage.parameters() if p.grad is not None]
@@ -874,6 +920,7 @@ def main():
     args.opd = args.diffusion_opd or args.dance_opd  # the on-policy distillation path (opd_step) for either
     assert args.opd_reuse >= 1, "--opd-reuse must be >= 1"
     assert args.opd or args.opd_reuse == 1, "--opd-reuse needs OPD"
+    assert not args.opd_state_weighting or (args.opd and args.opd_reuse > 1), "--opd-state-weighting needs OPD reuse > 1"
     if args.opd_states is None:
         args.opd_states = 1 if args.dance_opd else 4
     # long timeout: at 1024 px the held-out encoding / LM states and every eval take ~10 min on rank 0 while the
@@ -1360,7 +1407,8 @@ def main():
         qwen_tok, captions_en = klein_tokenizer(args.klein), CaptionText(args.data, train_names)
         log(f"{'--dance-opd' if args.dance_opd else '--diffusion-opd'}: teacher {args.klein} on ranks {teachers} (CFG {args.opd_cfg}), {args.opd_rollout_steps}-step student "
             f"trajectories, {args.opd_states} states each, {args.batch * args.opd_states} states per update; "
-            f"reuse {args.opd_reuse} updates per fresh batch (cache refreshed after resume)")
+            f"reuse {args.opd_reuse} updates per fresh batch (cache refreshed after resume); "
+            f"state weighting {args.opd_state_weighting}")
     if lm_client is not None and master and val_names:  # held-out LM states once (one request: see lm_server)
         ids_val = val[1].to(device)
         h = lm_client.request(val[1])
