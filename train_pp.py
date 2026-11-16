@@ -699,7 +699,8 @@ def opd_rollout(stage, z, ids, lm_states, mb, ts, picks, widths=None):
     """The student's own Euler trajectories from noise z (B, C, h, w): conditional velocity (no CFG) for the
     captions ids (lm_states: their (B, L, H) LM states or None), time grid ts (K + 1,), in micro-batches of mb; the
     text encoder runs once per micro-batch, not once per step. -> states (B, m, C, h, w) at the step indices picks
-    (B, m) (CPU)."""
+    (B, m) (CPU). Each fixed-size micro-batch stops at its last queried state; no forward is needed
+    at that state. Keeping micro-batch shapes fixed avoids extra compilation variants."""
     B, m = picks.shape
     chunks = []
     for j in range(0, B, mb):
@@ -708,18 +709,21 @@ def opd_rollout(stage, z, ids, lm_states, mb, ts, picks, widths=None):
             text, valid = stage.te(ids[j:j + mb, :w], lm_states=lm_states[j:j + mb, :w])
         else:
             text, valid = stage.te(ids[j:j + mb, :w])
-        chunks.append((slice(j, j + mb), (text, valid), ids[j:j + mb, :w]))
+        last = int(picks[j:j + mb].max())
+        chunks.append((slice(j, j + mb), (text, valid), ids[j:j + mb, :w], last))
     out = torch.empty(B, m, *z.shape[1:], device=z.device)
+    z = z.clone()  # slice updates must not modify the caller's initial noise
     try:
-        for k in range(len(ts) - 1):
+        for k in range(int(picks.max()) + 1):
             b_idx, r_idx = (picks == k).nonzero(as_tuple=True)  # CPU: no GPU sync
             if len(b_idx):
                 out[b_idx.to(z.device), r_idx.to(z.device)] = z[b_idx.to(z.device)]
-            v = []
-            for sl, cache, ids_j in chunks:
+            for sl, cache, ids_j, last in chunks:
+                if k >= last:
+                    continue
                 stage.text_cache = cache
-                v.append(stage(z[sl], ts[k].expand(ids_j.shape[0]), ids_j).float())
-            z = z + (ts[k + 1] - ts[k]) * torch.cat(v)
+                v = stage(z[sl], ts[k].expand(ids_j.shape[0]), ids_j).float()
+                z[sl] = z[sl] + (ts[k + 1] - ts[k]) * v
     finally:
         stage.text_cache = None
     return out
