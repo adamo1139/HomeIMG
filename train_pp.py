@@ -180,6 +180,8 @@ def get_args():
                    help="--diffusion-opd / --dance-opd: the --lm-rank server(s) also host klein (needs --klein-quant) and take a share of the "
                         "states like the --teacher-ranks; that GPU is otherwise ~99%% idle during OPD")
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--diffusion-opd / --dance-opd: Euler steps of the student's trajectories")
+    p.add_argument("--opd-reuse", type=int, default=1,
+                   help="optimizer updates per cached OPD batch, including the fresh update; 1 disables replay")
     p.add_argument("--opd-parts", type=int, default=2,
                    help="OPD rollout chunks per replica: pipeline teacher requests and backward; default 2, try 4")
     p.add_argument("--opd-states", type=int, default=None,
@@ -731,7 +733,7 @@ def opd_rollout(stage, z, ids, lm_states, mb, ts, picks, widths=None):
     return out
 
 
-def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses, parts=2):
+def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses, parts=2, cache=None):
     """One OPD step for this replica's batch (see --diffusion-opd / --dance-opd). The batch is cut into `parts`: part p+1 is rolled out
     (and later trained on) while the teachers score part p, to overlap teacher work with rollout and backward; all parts use
     this step's weights, so it stays on-policy."""
@@ -755,6 +757,10 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     per = -(-B // parts)
     assert (per * m) % mb == 0 or parts == 1, \
         f"OPD: {per} trajectories x {m} states must split into micro-batches of {mb}"
+    if cache is not None:
+        cache.clear()
+        cache.update(ids=ids.detach(), ids_cpu=None if ids_cpu is None else ids_cpu.detach(),
+                     lm=None if lm_full is None else lm_full.detach(), m=m, chunks=[])
     rep = lambda a: a.repeat_interleave(m, dim=0)
     def train_part(item):
         b0, b1, x, t, h = item
@@ -763,8 +769,11 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
             stage.lm_states = [full[i:i + mb] for i in range(0, len(full), mb)]
         ids_c = rep(ids_cpu[b0:b1]) if ids_cpu is not None else None
         w_rep = text_widths(ids_c, mb, args.text_bucket) if ids_c is not None and args.text_bucket else None
+        target = teacher.collect(h)
+        if cache is not None:
+            cache["chunks"].append((b0, b1, x.detach(), t.detach(), target.detach()))
         try:
-            return local_train_step(stage, x, t, rep(ids[b0:b1]), teacher.collect(h), mb, losses, w_rep,
+            return local_train_step(stage, x, t, rep(ids[b0:b1]), target, mb, losses, w_rep,
                                     divide=False)
         finally:
             stage.lm_states = states
@@ -789,6 +798,30 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
             pending = current
         if pending is not None:
             count += train_part(pending)
+    finally:
+        stage.lm_states = states
+    grads = [p.grad for p in stage.parameters() if p.grad is not None]
+    torch._foreach_div_(grads, count)
+
+
+def opd_replay(stage, cache, mb, losses, text_bucket=False):
+    """One new backward on detached teacher targets; never cache trainable text features or graphs."""
+    states = stage.lm_states
+    count = 0
+    m = cache["m"]
+    rep = lambda a: a.repeat_interleave(m, dim=0)
+    try:
+        for b0, b1, x, t, target in cache["chunks"]:
+            full = cache["lm"]
+            if full is not None:
+                full = rep(full[b0:b1])
+                stage.lm_states = [full[i:i + mb] for i in range(0, len(full), mb)]
+            else:
+                stage.lm_states = None
+            cpu = cache["ids_cpu"]
+            widths = text_widths(rep(cpu[b0:b1]), mb, text_bucket) if cpu is not None and text_bucket else None
+            count += local_train_step(stage, x, t, rep(cache["ids"][b0:b1]), target, mb, losses, widths,
+                                      divide=False)
     finally:
         stage.lm_states = states
     grads = [p.grad for p in stage.parameters() if p.grad is not None]
@@ -839,6 +872,8 @@ def main():
     args = resolve_defaults(get_args())
     assert not (args.diffusion_opd and args.dance_opd), "--diffusion-opd or --dance-opd, not both"
     args.opd = args.diffusion_opd or args.dance_opd  # the on-policy distillation path (opd_step) for either
+    assert args.opd_reuse >= 1, "--opd-reuse must be >= 1"
+    assert args.opd or args.opd_reuse == 1, "--opd-reuse needs OPD"
     if args.opd_states is None:
         args.opd_states = 1 if args.dance_opd else 4
     # long timeout: at 1024 px the held-out encoding / LM states and every eval take ~10 min on rank 0 while the
@@ -1109,6 +1144,7 @@ def main():
     ckpt_path = os.path.join(args.out, "latest.pt")
     opt_path = os.path.join(args.out, f"opt_stage{s}.pt")
     step, outer_state = 0, None
+    opd_batches = 0  # consumed fresh batches; replay cache is intentionally not checkpointed
     if os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location="cpu", weights_only=True, mmap=True)
         ck_cfg = DenoiserConfig(**ck["den_config"])
@@ -1153,6 +1189,7 @@ def main():
             print(f"rank {rank}: WARNING {opt_path} missing or saved with a different stage layout; weights resumed, "
                   f"optimizer state starts fresh", flush=True)
         step = ck["step"]
+        opd_batches = ck.get("opd_batches", step)
         log(f"resumed from {ckpt_path} at step {step}")
         del ck, os_ck
 
@@ -1257,7 +1294,7 @@ def main():
                 f"{', '.join(f'{r} px' for r in args.crop_res)} latents ({', '.join(k for k, _ in crops)})")
         if alt_suffix:
             log(f"captions: {100 * args.pl_prob:.0f}% Polish ({alt_suffix}), the rest English")
-        stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=step,
+        stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=opd_batches if args.opd else step,
                              sort_pad=LM_PAD if hf_lm else None, rows=args.opd,
                              res_groups=[(r, n * k) for r, n, k in mr_groups] or None)
         loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
@@ -1322,7 +1359,8 @@ def main():
         teacher_client = TeacherClient(teachers, device, control_group, shared=lm_servers if args.teacher_on_lm else ())
         qwen_tok, captions_en = klein_tokenizer(args.klein), CaptionText(args.data, train_names)
         log(f"{'--dance-opd' if args.dance_opd else '--diffusion-opd'}: teacher {args.klein} on ranks {teachers} (CFG {args.opd_cfg}), {args.opd_rollout_steps}-step student "
-            f"trajectories, {args.opd_states} states each, {args.batch * args.opd_states} states per step")
+            f"trajectories, {args.opd_states} states each, {args.batch * args.opd_states} states per update; "
+            f"reuse {args.opd_reuse} updates per fresh batch (cache refreshed after resume)")
     if lm_client is not None and master and val_names:  # held-out LM states once (one request: see lm_server)
         ids_val = val[1].to(device)
         h = lm_client.request(val[1])
@@ -1391,7 +1429,7 @@ def main():
         if master:
             te_sd = {n: raw[("te", n)] for n in te_names}
             den_sd = {n: raw[("den", n)] for n, _ in den.named_parameters()}
-            meta = dict(step=step, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=te_sd, den=den_sd)
+            meta = dict(step=step, opd_batches=opd_batches, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=te_sd, den=den_sd)
             if merge_only:
                 d = os.path.join(args.out, "merge")
                 os.makedirs(d, exist_ok=True)
@@ -1614,74 +1652,82 @@ def main():
                               device.type == "cuda", metadata={"args": vars(args), "den_config": asdict(den_cfg),
                                                                "te_config": asdict(te_cfg), "rank": rank})
     opt_window = []  # keep every step in the logging window, including cheap periodic-Muon steps
+    opd_cache, opd_pass = {}, 0
+    opd_acc = torch.zeros(4, device=device)  # fresh loss/count, replay loss/count
     pending = None  # --lm-rank: the next step's batch and its LM request, sent while the current step trains
     # all training ranks enter step 1 together: stages without data / validation work would otherwise start the
     # pipeline's first p2p (NCCL communicator setup) long before stage 0 is ready
     dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
     while step < args.steps:
         profile.begin_step(step + 1)
-        if lm_client is not None:
-            if pending is None:
-                nb = next_batch(step)
-                with profile.phase("lm_request"):
-                    pending = (nb, lm_client.request(nb[5]))
-            (x0, ids, t, eps, cond_ids, cond_cpu, rows, mcond), req = pending
-            if isinstance(x0, dict):  # --vae-on-lm: this step's latents from the LM server
-                with profile.phase("vae_wait"):
-                    x0 = LMClient.vae_collect(x0)
-            elif isinstance(x0, list):  # --multi-res groups
-                with profile.phase("vae_wait"):
-                    for gr in x0:
-                        if isinstance(gr["x0"], dict):
-                            gr["x0"] = LMClient.vae_collect(gr["x0"])
-            with profile.phase("lm_wait_collect"):
-                lm_full = lm_client.collect(req)
-            del req
-            pending = None
-            if step + 1 < args.steps:
-                nb = next_batch(step + 1)
-                with profile.phase("lm_request"):
-                    pending = (nb, lm_client.request(nb[5]))
-        else:
-            x0, ids, t, eps, cond_ids, cond_cpu, rows, mcond = next_batch(step)
-        stage_mod.lm_states = None
-        if isinstance(x0, list) and not isinstance(x0[0]["x0"], torch.Tensor):  # --multi-res without an LM server
-            for gr in x0:
-                if isinstance(gr["x0"], dict):
-                    gr["x0"] = LMClient.vae_collect(gr["x0"])
-        if lm_client is not None and isinstance(x0, list):  # --multi-res: each group its rows' LM states
-            for gr in x0:
-                h = lm_full[gr["idx"].to(lm_full.device)]
-                gr["lm"] = [h[j * gr["mb"]:(j + 1) * gr["mb"]] for j in range(gr["n"])]
-            del lm_full
-        elif lm_client is not None:
-            stage_mod.lm_states = [lm_full[k * mb:(k + 1) * mb] for k in range(M)]
-            del lm_full
-        if lm_offload and args.lm_split:  # whole step's captions through the stages' LM slices, ~32 per chunk
-            per = max(1, 32 // mb)
-            groups = [list(range(i, min(M, i + per))) for i in range(0, M, per)]
-            got = lm_split_forward_([torch.cat([cond_ids[k * mb:(k + 1) * mb] for k in g]) for g in groups])
-            if got is not None:
-                stage_mod.lm_states = [h[j * mb:(j + 1) * mb] for g, h in zip(groups, got) for j in range(len(g))]
-        elif lm_offload:
-            mine = {}
-            ks = [k for k in range(M) if k % pp == s]
-            if hf_lm and pp == 1:  # the whole batch in one packed LM call (hf_states_packed cuts it to ~8k tokens)
-                with profile.phase("lm_local"):
-                    h = lm_fn(cond_ids)
-                mine = {k: h[k * mb:(k + 1) * mb] for k in range(M)}
-            elif hf_lm:  # ~32 captions per LM call (the MoE's sweet spot; micro-batches of similar length go together)
-                per = max(1, 32 // mb)
-                for i in range(0, len(ks), per):
-                    group = ks[i:i + per]
-                    h = lm_fn(torch.cat([cond_ids[k * mb:(k + 1) * mb] for k in group]))
-                    for j, k in enumerate(group):
-                        mine[k] = h[j * mb:(j + 1) * mb]
+        replay = args.opd and bool(opd_cache) and opd_pass < args.opd_reuse
+        if not replay:
+            opd_cache.clear()  # release old latent targets before generating the next batch
+            opd_pass = 0
+            if lm_client is not None:
+                if pending is None:
+                    nb = next_batch(step)
+                    with profile.phase("lm_request"):
+                        pending = (nb, lm_client.request(nb[5]))
+                (x0, ids, t, eps, cond_ids, cond_cpu, rows, mcond), req = pending
+                if isinstance(x0, dict):  # --vae-on-lm: this step's latents from the LM server
+                    with profile.phase("vae_wait"):
+                        x0 = LMClient.vae_collect(x0)
+                elif isinstance(x0, list):  # --multi-res groups
+                    with profile.phase("vae_wait"):
+                        for gr in x0:
+                            if isinstance(gr["x0"], dict):
+                                gr["x0"] = LMClient.vae_collect(gr["x0"])
+                with profile.phase("lm_wait_collect"):
+                    lm_full = lm_client.collect(req)
+                del req
+                pending = None
+                if step + 1 < args.steps and (not args.opd or args.opd_reuse == 1):
+                    nb = next_batch(step + 1)
+                    with profile.phase("lm_request"):
+                        pending = (nb, lm_client.request(nb[5]))
             else:
-                for k in ks:
-                    with amp:
-                        mine[k] = lm_fn(cond_ids[k * mb:(k + 1) * mb])
-            stage_mod.lm_states = gather_to_stage(mine, M, s, pp, 0, replica * pp)
+                x0, ids, t, eps, cond_ids, cond_cpu, rows, mcond = next_batch(step)
+            stage_mod.lm_states = None
+            if isinstance(x0, list) and not isinstance(x0[0]["x0"], torch.Tensor):  # --multi-res without an LM server
+                for gr in x0:
+                    if isinstance(gr["x0"], dict):
+                        gr["x0"] = LMClient.vae_collect(gr["x0"])
+            if lm_client is not None and isinstance(x0, list):  # --multi-res: each group its rows' LM states
+                for gr in x0:
+                    h = lm_full[gr["idx"].to(lm_full.device)]
+                    gr["lm"] = [h[j * gr["mb"]:(j + 1) * gr["mb"]] for j in range(gr["n"])]
+                del lm_full
+            elif lm_client is not None:
+                stage_mod.lm_states = [lm_full[k * mb:(k + 1) * mb] for k in range(M)]
+                del lm_full
+            if lm_offload and args.lm_split:  # whole step's captions through the stages' LM slices, ~32 per chunk
+                per = max(1, 32 // mb)
+                groups = [list(range(i, min(M, i + per))) for i in range(0, M, per)]
+                got = lm_split_forward_([torch.cat([cond_ids[k * mb:(k + 1) * mb] for k in g]) for g in groups])
+                if got is not None:
+                    stage_mod.lm_states = [h[j * mb:(j + 1) * mb] for g, h in zip(groups, got) for j in range(len(g))]
+            elif lm_offload:
+                mine = {}
+                ks = [k for k in range(M) if k % pp == s]
+                if hf_lm and pp == 1:  # the whole batch in one packed LM call (hf_states_packed cuts it to ~8k tokens)
+                    with profile.phase("lm_local"):
+                        h = lm_fn(cond_ids)
+                    mine = {k: h[k * mb:(k + 1) * mb] for k in range(M)}
+                elif hf_lm:  # ~32 captions per LM call (the MoE's sweet spot; micro-batches of similar length go together)
+                    per = max(1, 32 // mb)
+                    for i in range(0, len(ks), per):
+                        group = ks[i:i + per]
+                        h = lm_fn(torch.cat([cond_ids[k * mb:(k + 1) * mb] for k in group]))
+                        for j, k in enumerate(group):
+                            mine[k] = h[j * mb:(j + 1) * mb]
+                else:
+                    for k in ks:
+                        with amp:
+                            mine[k] = lm_fn(cond_ids[k * mb:(k + 1) * mb])
+                stage_mod.lm_states = gather_to_stage(mine, M, s, pp, 0, replica * pp)
+            if args.opd:
+                opd_batches += 1
         stage_mod.repa_targets = None
         if step < repa_steps and step % args.repa_every == 0:
             n_repa = max(1, round(args.repa_frac * mb))
@@ -1704,7 +1750,9 @@ def main():
                     dist.recv(x0, src=replica * pp, group=x0_groups[replica])
             try:
                 with amp:
-                    if first and isinstance(x0, list):  # --multi-res: one local_train_step per resolution group
+                    if replay:
+                        opd_replay(stage_mod, opd_cache, mb, losses, args.text_bucket)
+                    elif first and isinstance(x0, list):  # --multi-res: one local_train_step per resolution group
                         count = 0
                         for gi, gr in enumerate(x0):
                             tt = gr["t"].view(-1, 1, 1, 1)
@@ -1726,7 +1774,8 @@ def main():
                         z_t = (1 - tt) * x0 + tt * eps
                         if args.opd:
                             opd_step(stage_mod, teacher_client, qwen_tok, captions_en(rows.tolist()), eps, cond_ids,
-                                     cond_cpu, mb, args, step, replica, losses, parts=args.opd_parts)
+                                     cond_cpu, mb, args, step, replica, losses, parts=args.opd_parts,
+                                     cache=opd_cache if args.opd_reuse > 1 else None)
                         elif pp == 1:
                             widths = (text_widths(cond_cpu, mb, args.text_bucket)
                                       if cond_cpu is not None and args.text_bucket else None)
@@ -1751,6 +1800,10 @@ def main():
         if losses:
             acc[0] += torch.stack([l.detach().float() for l in losses]).mean()
             acc[1] += 1
+            if args.opd:
+                j = 2 if replay else 0
+                opd_acc[j] += torch.stack([l.detach().float() for l in losses]).mean()
+                opd_acc[j + 1] += 1
         if stage_mod.repa_losses:
             acc[2] += torch.stack(stage_mod.repa_losses).mean()
             acc[3] += 1
@@ -1790,6 +1843,8 @@ def main():
                 dump_snapshot("OOM")
                 raise
         step += 1
+        if args.opd:
+            opd_pass += 1
         if args.mem_debug and step <= 3:
             mem_report_all(f"step {step}")
         if step == 2:
@@ -1821,6 +1876,14 @@ def main():
             stats = {"opt_ms": opt_ms, "opt_max_ms": opt_max_ms, "train/samples": step * args.batch, "train/loss_fm": (acc[0] / acc[1].clamp(min=1)).item(),
                      "train/loss_repa": (acc[2] / acc[3].clamp(min=1)).item(), "train/grad_norm": gnorm.item(),
                      "lr_mult": mult}
+            if args.opd:
+                dist.all_reduce(opd_acc, group=train_group)
+                for j, label in ((0, "fresh"), (2, "replay")):
+                    if opd_acc[j + 1] > 0:
+                        stats[f"opd/loss_{label}"] = (opd_acc[j] / opd_acc[j + 1]).item()
+                opd_acc.zero_()
+                stats.update({"opd/reuse_pass": opd_pass, "opd/fresh_batches": opd_batches,
+                              "opd/fresh_trajectories": opd_batches * args.batch})
             mfu = ""
             repa_s = f"repa {stats['train/loss_repa']:.3f} | " if acc[3] > 0 else ""
             if replica == 0:
@@ -1859,9 +1922,10 @@ def main():
             if peak:
                 stats["mfu"] = stats["tflops_per_gpu"] / peak
                 mfu = f" MFU {stats['mfu']:.0%}"
+            opd_s = f" | OPD {'replay' if replay else 'fresh'} {opd_pass}/{args.opd_reuse}" if args.opd else ""
             log(f"step {step:>7} | fm {stats['train/loss_fm']:.4f} | {repa_s}grad_norm {stats['train/grad_norm']:.3f} | "
                 f"{f'lr x{mult:.3f} | ' if mult != 1.0 else ''}{stats['imgs_per_s']:.0f} img/s | "
-                f"~{stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | opt avg {opt_ms:.0f} ms | eta {(args.steps - step) / stats['steps_per_s'] / 3600:.1f} h{mem_s}",
+                f"~{stats['tflops_per_gpu']:.1f} TFLOPS/GPU{mfu} | opt avg {opt_ms:.0f} ms | eta {(args.steps - step) / stats['steps_per_s'] / 3600:.1f} h{mem_s}{opd_s} | {dt / n:.2f} s/update",
                 flush=True)
             if wb:
                 wb.log(stats, step=step)
