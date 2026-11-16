@@ -45,7 +45,7 @@ print('Prepared cache: no backward/collection during generation; exact gradients
 main=next(n for n in ast.parse(src).body if getattr(n,'name','')=='main')
 loop=next(n for n in main.body if isinstance(n,ast.While))
 a=next(i for i,n in enumerate(loop.body) if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='replay' for t in n.targets))
-gate=compile(ast.Module(body=loop.body[a:a+4],type_ignores=[]),'<gate>','exec')
+gate=compile(ast.Module(body=loop.body[a:a+5],type_ignores=[]),'<gate>','exec')
 prefetch=next(n for n in loop.body if isinstance(n,ast.If) and 'opd_prefetch' in ast.unparse(n.test))
 condition=compile(ast.Expression(prefetch.test),'<prefetch-condition>','eval')
 for start in (0,5,8):
@@ -53,7 +53,7 @@ for start in (0,5,8):
     def batch(step):
         calls.append(step)
         return torch.zeros(1),None,None,None,None,None,None,None
-    env=dict(args=SimpleNamespace(opd=True,opd_reuse=8,opd_prefetch=True,steps=start+32),
+    env=dict(actor_client=None,args=SimpleNamespace(opd=True,opd_reuse=8,opd_prefetch=True,steps=start+32),
              opd_next=None,opd_cache={},opd_pass=0,opd_batches=0,lm_client=None,next_batch=batch,
              stage_mod=SimpleNamespace(lm_states=None),lm_offload=False,torch=torch)
     activations=[];prefetches=[]
