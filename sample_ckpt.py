@@ -1,6 +1,6 @@
-"""Images from a model whose text encoder the diffusers pipeline does not know yet (frozen-LM encoders such as
-Poziomka): a train.py checkpoint (EMA weights if it has them) or a model exported by this script (local dir or Hub
-repo). By default the README prompts in English and in Polish, with the same noise for prompt k in both grids, so the
+"""Images from a training checkpoint (EMA weights if present), a self-contained Diffusers export,
+or a legacy export made by this script (local dir or Hub repo). Diffusers exports use their own pipeline
+and encoder classes, including bundled Poziomka weights. By default the README prompts in English and in Polish, with the same noise for prompt k in both grids, so the
 two languages can be compared image by image; --prompt for your own. --export writes the weights (EMA) as
 safetensors + configs + the decoder, for a Hub upload.
 
@@ -76,6 +76,45 @@ def load(src, raw=False, res=None, rope_ref=None):
     return te, den, dict(step=info.get("step"), weights=info.get("weights", "exported"), root=root)
 
 
+def sample_pipeline_export(a, root):
+    """Load self-contained Diffusers exports using their exported model classes."""
+    from diffusers import DiffusionPipeline, AutoencoderKLFlux2
+    if a.raw or a.export:
+        raise ValueError("--raw / --export require a .pt checkpoint; an HF export already contains selected weights")
+    pipe = DiffusionPipeline.from_pretrained(root, custom_pipeline=root, trust_remote_code=True)
+    if a.vae is not None:
+        pipe.vae = AutoencoderKLFlux2.from_pretrained(a.vae)
+    pipe.to("cuda")
+    pipe.vae.to(torch.bfloat16)
+    sets = [("en", PROMPTS), ("pl", PROMPTS_PL)] if a.prompt is None else [("prompt", a.prompt)]
+    for lang, prompts in sets:
+        images = []
+        for i in range(0, len(prompts), a.batch):
+            # Match fid.sample's seed per batch; reset for each language.
+            g = torch.Generator(device="cuda").manual_seed(a.seed * 1_000_003 + i)
+            images.extend(pipe(prompts[i:i + a.batch], num_inference_steps=a.steps,
+                               guidance_scale=a.cfg, generator=g, resolution=a.res,
+                               time_shift=a.t_shift, rope_ref=a.rope_ref,
+                               attn_scale=a.attn_scale).images)
+        if a.prompt is not None:
+            for i, im in enumerate(images):
+                path = os.path.join(a.out_dir, f"{i:02d}.png")
+                im.save(path)
+                print(f"saved {path}")
+        else:
+            w, h = images[0].size
+            grid = Image.new("RGB", (4 * w, 2 * h))
+            for i, im in enumerate(images):
+                grid.paste(im, ((i % 4) * w, (i // 4) * h))
+            suffix = (f"_{a.res}px" if a.res else "")
+            suffix += f"_rope{a.rope_ref}" if a.rope_ref is not None else ""
+            suffix += f"_as{a.attn_scale:g}" if a.attn_scale != 1.0 else ""
+            suffix += f"_ts{a.t_shift:g}" if a.t_shift != 1.0 else ""
+            path = os.path.join(a.out_dir, f"grid_{lang}{suffix}.png")
+            grid.save(path)
+            print(f"saved {path}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("ckpt")
@@ -106,6 +145,16 @@ def main():
     a = p.parse_args()
     device = torch.device("cuda")
     os.makedirs(a.out_dir, exist_ok=True)
+
+    if a.batch < 1:
+        p.error("--batch must be positive")
+    if not a.ckpt.endswith(".pt"):
+        from huggingface_hub import snapshot_download
+        root = a.ckpt if os.path.isdir(a.ckpt) else snapshot_download(a.ckpt)
+        if os.path.isfile(os.path.join(root, "model_index.json")):
+            sample_pipeline_export(a, root)
+            return
+        a.ckpt = root  # legacy training-class exports without model_index.json
 
     te, den, info = load(a.ckpt, a.raw, a.res, a.rope_ref)
     te_cfg, den_cfg = te.config, den.config
