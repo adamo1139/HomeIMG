@@ -180,6 +180,8 @@ def get_args():
                    help="--diffusion-opd / --dance-opd: the --lm-rank server(s) also host klein (needs --klein-quant) and take a share of the "
                         "states like the --teacher-ranks; that GPU is otherwise ~99%% idle during OPD")
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--diffusion-opd / --dance-opd: Euler steps of the student's trajectories")
+    p.add_argument("--opd-parts", type=int, default=2,
+                   help="OPD rollout chunks per replica: pipeline teacher requests and backward; default 2, try 4")
     p.add_argument("--opd-states", type=int, default=None,
                    help="--diffusion-opd / --dance-opd: states per trajectory (distinct random steps) the teacher scores and the student trains on")
     p.add_argument("--dist-timeout", type=float, default=120,
@@ -731,7 +733,7 @@ def opd_rollout(stage, z, ids, lm_states, mb, ts, picks, widths=None):
 
 def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses, parts=2):
     """One OPD step for this replica's batch (see --diffusion-opd / --dance-opd). The batch is cut into `parts`: part p+1 is rolled out
-    (and later trained on) while the teachers score part p, so neither side waits for the other; all parts use
+    (and later trained on) while the teachers score part p, to overlap teacher work with rollout and backward; all parts use
     this step's weights, so it stays on-policy."""
     from aurora.klein import tokenize
     B, m, K = eps.shape[0], args.opd_states, args.opd_rollout_steps
@@ -749,30 +751,44 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     q_ids, q_mask = tokenize(qwen_tok, texts_en)
     states = stage.lm_states
     lm_full = torch.cat(states) if states is not None else None  # (B, L, H)
+    assert parts > 0, "--opd-parts must be positive"
     per = -(-B // parts)
     assert (per * m) % mb == 0 or parts == 1, \
         f"OPD: {per} trajectories x {m} states must split into micro-batches of {mb}"
     rep = lambda a: a.repeat_interleave(m, dim=0)
-    pending = []
-    for b0 in range(0, B, per):  # roll out every part and send it; the teachers start on part 0 at once
-        b1 = min(B, b0 + per)
-        ids_c = ids_cpu[b0:b1] if ids_cpu is not None else None
-        widths = text_widths(ids_c, mb, args.text_bucket) if ids_c is not None and args.text_bucket else None
-        x = opd_rollout(stage, eps[b0:b1], ids[b0:b1], lm_full[b0:b1] if lm_full is not None else None, mb, ts,
-                        picks[b0:b1], widths).flatten(0, 1)
-        t = ts[picks[b0:b1].to(eps.device)].flatten()
-        cap = torch.arange(b1 - b0, device=eps.device).repeat_interleave(m)
-        pending.append((b0, b1, x, t, teacher.request(q_ids[b0:b1], q_mask[b0:b1], x, t, cap)))
+    def train_part(item):
+        b0, b1, x, t, h = item
+        if lm_full is not None:
+            full = rep(lm_full[b0:b1])
+            stage.lm_states = [full[i:i + mb] for i in range(0, len(full), mb)]
+        ids_c = rep(ids_cpu[b0:b1]) if ids_cpu is not None else None
+        w_rep = text_widths(ids_c, mb, args.text_bucket) if ids_c is not None and args.text_bucket else None
+        try:
+            return local_train_step(stage, x, t, rep(ids[b0:b1]), teacher.collect(h), mb, losses, w_rep,
+                                    divide=False)
+        finally:
+            stage.lm_states = states
+
+    pending = None
     count = 0
     try:
-        for b0, b1, x, t, h in pending:  # then train on each part as its targets arrive
-            if lm_full is not None:
-                full = rep(lm_full[b0:b1])
-                stage.lm_states = [full[i:i + mb] for i in range(0, len(full), mb)]
-            ids_c = rep(ids_cpu[b0:b1]) if ids_cpu is not None else None
-            w_rep = text_widths(ids_c, mb, args.text_bucket) if ids_c is not None and args.text_bucket else None
-            count += local_train_step(stage, x, t, rep(ids[b0:b1]), teacher.collect(h), mb, losses, w_rep,
-                                      divide=False)
+        for b0 in range(0, B, per):
+            b1 = min(B, b0 + per)
+            assert ((b1 - b0) * m) % mb == 0, "OPD chunk states must fill training micro-batches"
+            ids_c = ids_cpu[b0:b1] if ids_cpu is not None else None
+            widths = text_widths(ids_c, mb, args.text_bucket) if ids_c is not None and args.text_bucket else None
+            x = opd_rollout(stage, eps[b0:b1], ids[b0:b1], lm_full[b0:b1] if lm_full is not None else None, mb, ts,
+                            picks[b0:b1], widths).flatten(0, 1)
+            t = ts[picks[b0:b1].to(eps.device)].flatten()
+            cap = torch.arange(b1 - b0, device=eps.device).repeat_interleave(m)
+            current = (b0, b1, x, t, teacher.request(q_ids[b0:b1], q_mask[b0:b1], x, t, cap))
+            # Teacher scores current while the student backpropagates the previous chunk.
+            # No optimizer update occurs here: all rollouts use this step's weights.
+            if pending is not None:
+                count += train_part(pending)
+            pending = current
+        if pending is not None:
+            count += train_part(pending)
     finally:
         stage.lm_states = states
     grads = [p.grad for p in stage.parameters() if p.grad is not None]
@@ -1710,7 +1726,7 @@ def main():
                         z_t = (1 - tt) * x0 + tt * eps
                         if args.opd:
                             opd_step(stage_mod, teacher_client, qwen_tok, captions_en(rows.tolist()), eps, cond_ids,
-                                     cond_cpu, mb, args, step, replica, losses)
+                                     cond_cpu, mb, args, step, replica, losses, parts=args.opd_parts)
                         elif pp == 1:
                             widths = (text_widths(cond_cpu, mb, args.text_bucket)
                                       if cond_cpu is not None and args.text_bucket else None)

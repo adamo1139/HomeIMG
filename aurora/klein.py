@@ -236,6 +236,7 @@ class TeacherClient:
 
     def __init__(self, servers, device, control_group, shared=()):
         self.servers, self.device, self.group = list(servers), device, control_group
+        self.request_index = 0
         self.tag = {s: (1 if s in set(shared) else TAG_HDR) for s in self.servers}
 
     def request(self, ids, mask, x, t, cap):
@@ -245,7 +246,12 @@ class TeacherClient:
         parts = []
         bounds = torch.linspace(0, len(ids), len(self.servers) + 1).round().long().tolist()
         cap_cpu = cap.cpu()
-        for server, c0, c1 in zip(self.servers, bounds[:-1], bounds[1:]):
+        assignments = list(zip(self.servers, bounds[:-1], bounds[1:]))
+        offset = (dist.get_rank() + self.request_index) % len(assignments)
+        self.request_index += 1
+        # Rotate dispatch only; collect restores the original trajectory order.
+        assignments = assignments[offset:] + assignments[:offset]
+        for server, c0, c1 in assignments:
             if c1 == c0:
                 continue
             s0, s1 = int(torch.searchsorted(cap_cpu, c0)), int(torch.searchsorted(cap_cpu, c1))
@@ -258,14 +264,14 @@ class TeacherClient:
             reqs += [dist.isend(b, dst=server) for b in bufs]
             out = torch.empty(s1 - s0, 128, h, w, dtype=torch.bfloat16, device=self.device)
             reqs.append(dist.irecv(out, src=server))
-            parts.append(dict(reqs=reqs, keep=(ctrl, bufs), out=out))
+            parts.append(dict(reqs=reqs, keep=(ctrl, bufs), out=out, start=s0))
         return parts
 
     def collect(self, parts):
         for p in parts:
             for r in p["reqs"]:
                 r.wait()
-        return torch.cat([p["out"] for p in parts]).float()
+        return torch.cat([p["out"] for p in sorted(parts, key=lambda p: p["start"])]).float()
 
     def stop(self):
         import torch.distributed as dist
