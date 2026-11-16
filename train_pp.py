@@ -188,6 +188,8 @@ def get_args():
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--diffusion-opd / --dance-opd: Euler steps of the student's trajectories")
     p.add_argument("--opd-actor", action="store_true",
                    help="one dedicated rollout GPU; fresh snapshot at cycle start, next batch generated during replay")
+    p.add_argument("--opd-actor-gpu", type=int, default=-1,
+                   help="GPU for the rollout actor in CUDA_DEVICE_ORDER numbering; -1 uses rank order; needs --opd-actor")
     p.add_argument("--opd-prefetch", action="store_true",
                    help="prepare one future OPD cache during replay; needs reuse > 1 and an LM server; rollouts are stale")
     p.add_argument("--opd-state-weighting", action="store_true",
@@ -1001,6 +1003,8 @@ def main():
     assert not args.opd_actor or (args.opd and args.pp == 1 and args.lm_rank == 1 and args.opd_reuse > 1
                                  and not args.opd_prefetch and args.repa_weight == 0 and not args.vae_rank
                                  and not args.vae_on_lm), "--opd-actor needs OPD, pp=1, one LM, reuse>1; no local prefetch/REPA/VAE server"
+    assert args.opd_actor_gpu >= -1, "--opd-actor-gpu must be -1 or a GPU index"
+    assert args.opd_actor or args.opd_actor_gpu == -1, "--opd-actor-gpu needs --opd-actor"
     if args.opd_states is None:
         args.opd_states = 1 if args.dance_opd else 4
     # long timeout: at 1024 px the held-out encoding / LM states and every eval take ~10 min on rank 0 while the
@@ -1037,6 +1041,14 @@ def main():
         local = order[int(os.environ.get("LOCAL_RANK", 0))]
     elif args.skip_gpus:
         local = usable[int(os.environ.get("LOCAL_RANK", 0))]
+    if args.opd_actor_gpu >= 0:
+        assert len(usable) == world_all, "Explicit actor GPU placement needs one local GPU per rank"
+        assert args.opd_actor_gpu in usable, "--opd-actor-gpu is missing or excluded by --skip-gpus"
+        assert all(d in usable for d in tail), "An explicitly assigned server GPU is unavailable"
+        assert args.opd_actor_gpu not in tail, "Actor GPU must differ from LM and VAE GPUs"
+        order = [d for d in usable if d not in tail and d != args.opd_actor_gpu] + tail
+        order.insert(actor_rank, args.opd_actor_gpu)
+        local = order[int(os.environ.get("LOCAL_RANK", 0))]
     if os.environ.get("PP_CPU"):  # tests/check_pp.py: gloo on CPU
         device = torch.device("cpu")
     else:
