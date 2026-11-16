@@ -4,7 +4,7 @@ resolution and language: CFG 3, 50 steps, seed 0. The noise is drawn in batches 
 
   python tests/flux36_grid.py runs/poziomka_1024px/latest.pt --vae exports/HomeIMG-1.2B-PL-EN-epoch47.5/vae \
       --name epoch47.75 --res 256 512 768 1024 --out-dir exports/grids36
-(a training checkpoint; exported folders made before the current text encoder format don't load)
+Training checkpoints, legacy exports and self-contained Diffusers exports are supported.
 
 Several GPUs: --lang and --part K --parts N (N of 1 / 2 / 3: blocks of 12 prompts, the same noise as the whole grid),
 one process per GPU; each saves its tiles and the last one to finish puts the grid together, e.g. 6 GPUs at 1024 px:
@@ -43,6 +43,8 @@ def main():
     p.add_argument("--part", type=int, default=0, help="only this part of the prompts (see --parts)")
     p.add_argument("--parts", type=int, default=1, choices=[1, 2, 3], help="split the 36 prompts into this many parts")
     a = p.parse_args()
+    if not 0 <= a.part < a.parts:
+        p.error("--part must be in [0, --parts)")
     os.makedirs(a.out_dir, exist_ok=True)
     name = a.name or os.path.basename(os.path.normpath(a.model if not a.model.endswith(".pt")
                                                        else os.path.dirname(a.model)))
@@ -51,18 +53,32 @@ def main():
     if a.lang:
         prompts = {a.lang: prompts[a.lang]}
     blocks = [list(range(0, 36, 12))[i::a.parts] for i in range(a.parts)][a.part]  # this part's blocks of 12
+    root = a.model
+    pipe = None
+    if not a.model.endswith(".pt"):
+        if not os.path.isdir(root):
+            from huggingface_hub import snapshot_download
+            root = snapshot_download(root)
+        if os.path.isfile(os.path.join(root, "model_index.json")):
+            from diffusers import DiffusionPipeline, AutoencoderKLFlux2
+            pipe = DiffusionPipeline.from_pretrained(root, custom_pipeline=root, trust_remote_code=True)
+            if a.vae:
+                pipe.vae = AutoencoderKLFlux2.from_pretrained(a.vae)
+            pipe.to("cuda")
+            pipe.vae.to(torch.bfloat16)
     vae = None
     for res in a.res:
-        te, den, info = load(a.model, False, res, None)
-        te.to("cuda").eval(), den.to("cuda").eval()
-        for m in den.modules():
-            if hasattr(m, "logit_mult"):
-                m.logit_mult = a.attn_scale
-        if vae is None:
-            path = a.vae or (info["root"] and os.path.join(info["root"], "vae"))
-            assert path and os.path.isdir(path), "no vae/ next to the model: pass --vae"
-            vae = REPATarget(path, "vit_base_patch14_reg4_dinov2.lvd142m", "cuda")
-        null_row = torch.from_numpy(te.null_ids()).to("cuda")[None]
+        if pipe is None:
+            te, den, info = load(root, False, res, None)
+            te.to("cuda").eval(), den.to("cuda").eval()
+            for m in den.modules():
+                if hasattr(m, "logit_mult"):
+                    m.logit_mult = a.attn_scale
+            if vae is None:
+                path = a.vae or (info["root"] and os.path.join(info["root"], "vae"))
+                assert path and os.path.isdir(path), "no vae/ next to the model: pass --vae"
+                vae = REPATarget(path, "vit_base_patch14_reg4_dinov2.lvd142m", "cuda")
+            null_row = torch.from_numpy(te.null_ids()).to("cuda")[None]
         dec = max(1, int(12 * (256 / res) ** 2))  # decoder images per call: 12 at 256 px, 1 at 1024 px
         for lang, ps in prompts.items():
             tiles = os.path.join(a.out_dir, f".tiles_{name}_{res}px_{lang}")
@@ -72,13 +88,30 @@ def main():
                     # noise in batches of 12 (as the earlier grids), denoised 12 / 5 / 3 at a time at <= 512 / 768 /
                     # 1024 px (24 GB). Poziomka's MoE routing depends slightly on the batch: keep this fixed per res.
                     cb = max(1, min(12, int(12 * (512 / res) ** 2)))
-                    z = fidlib.sample(te, den, tokenize(ps[b0:b0 + 12], te.config), null_row, a.steps, a.cfg, 0, "cuda",
-                                      batch=12, shift=a.t_shift, compute_batch=cb, noise_offset=b0)
-                    imgs = torch.cat([((vae.decode(z[i:i + dec]) + 1) / 2).clamp(0, 1).cpu()
-                                      for i in range(0, len(z), dec)])
+                    if pipe is None:
+                        z = fidlib.sample(te, den, tokenize(ps[b0:b0 + 12], te.config), null_row, a.steps, a.cfg, 0, "cuda",
+                                          batch=12, shift=a.t_shift, compute_batch=cb, noise_offset=b0)
+                        imgs = torch.cat([((vae.decode(z[i:i + dec]) + 1) / 2).clamp(0, 1).cpu()
+                                          for i in range(0, len(z), dec)])
+                    else:
+                        # Exactly the same block seed/shape as fid.sample; slicing must follow noise generation.
+                        g = torch.Generator(device="cuda").manual_seed(b0)
+                        noise = torch.randn(12, pipe.transformer.config.latent_channels, res // 16, res // 16,
+                                            device="cuda", generator=g, dtype=torch.float32)
+                        zs = []
+                        for j in range(0, 12, cb):
+                            zs.append(pipe(ps[b0 + j:b0 + min(j + cb, 12)], latents=noise[j:j + cb],
+                                           resolution=res, num_inference_steps=a.steps, guidance_scale=a.cfg,
+                                           time_shift=a.t_shift, attn_scale=a.attn_scale, output_type="latent").images)
+                        z = torch.cat(zs)
+                        imgs = torch.cat([((pipe.decode_latents(z[i:i + dec], chunk_size=dec) + 1) / 2)
+                                          .clamp(0, 1).cpu() for i in range(0, len(z), dec)])
                 arr = (imgs.permute(0, 2, 3, 1).float().numpy() * 255).round().astype(np.uint8)
                 for j, im in enumerate(arr):
-                    Image.fromarray(im).save(os.path.join(tiles, f"{b0 + j:02d}.png"))
+                    tile = os.path.join(tiles, f"{b0 + j:02d}.png")
+                    tmp = f"{tile}.{os.getpid()}.tmp"
+                    Image.fromarray(im).save(tmp, format="PNG")
+                    os.replace(tmp, tile)
                 print(f"{lang} {res} px: prompts {b0}-{b0 + len(arr) - 1}", flush=True)
             done = sorted(f for f in os.listdir(tiles) if f.endswith(".png"))
             if len(done) == 36:  # the last part to finish puts the grid together
@@ -86,9 +119,12 @@ def main():
                 for k, f in enumerate(done):
                     grid.paste(Image.open(os.path.join(tiles, f)), (res * (k % 6), res * (k // 6)))
                 path = os.path.join(a.out_dir, f"{name}_flux36_{res}px_{lang}.jpg")
-                grid.save(path, quality=92)
+                tmp = f"{path}.{os.getpid()}.tmp"
+                grid.save(tmp, format="JPEG", quality=92)
+                os.replace(tmp, path)
                 print("saved", path, flush=True)
-        del te, den
+        if pipe is None:
+            del te, den
         gc.collect()
         torch.cuda.empty_cache()
 
