@@ -1,0 +1,12 @@
+{
+  "resolution": 1024,
+  "guidance_scale": 3.0,
+  "time_shift": 6.0,
+  "num_inference_steps": 50,
+  "seeds": [
+    0,
+    1,
+    2,
+    3
+  ]
+}
