@@ -196,6 +196,12 @@ def get_args():
                    help="replay: bounded 0.5..1.5 weights from previous-update MSE within four t bins; needs reuse > 1")
     p.add_argument("--opd-reuse", type=int, default=1,
                    help="optimizer updates per cached OPD batch, including the fresh update; 1 disables replay")
+    p.add_argument("--opd-resolutions", type=int, nargs="+", default=[],
+                   help="one resolution per fresh rollout batch, unchanged throughout replay; e.g. 256 512 1024")
+    p.add_argument("--opd-res-weights", type=float, nargs="+", default=[],
+                   help="relative probabilities of fresh batches, NOT token proportions; default: equal")
+    p.add_argument("--opd-res-shifts", type=float, nargs="+", default=[],
+                   help="time shifts per OPD resolution; e.g. 1.5 3 6; default: res / t-shift-ref or t-shift * res / res_max")
     p.add_argument("--keep-ckpt-steps", type=int, nargs="*", default=[],
                    help="also keep weights and EMA as step_NNNNNNN.pt at these updates (optimizer stays in latest files)")
     p.add_argument("--opd-parts", type=int, default=2,
@@ -762,6 +768,7 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     this step's weights, so it stays on-policy."""
     assert not prepare_only or cache is not None, "prepare-only needs a cache"
     from aurora.klein import tokenize
+    from aurora.opd_resolution import time_shift
     B, m, K = eps.shape[0], args.opd_states, args.opd_rollout_steps
     g = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + step + 7)
     if args.dance_opd:  # DanceOPD: Beta(A, B) (--dance-beta, the paper's 5 2) over the normalised trajectory
@@ -773,7 +780,9 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     # instead of K fixed values (the trajectories still start at pure noise and end at t = 0)
     d = torch.rand((), generator=g).item()
     u = torch.cat([torch.ones(1), 1 - (torch.arange(1, K) - d) / K, torch.zeros(1)]).clamp(0, 1).to(eps.device)
-    ts = args.t_shift * u / (1 + (args.t_shift - 1) * u)
+    resolution = eps.shape[-1] * 16
+    shift = time_shift(args, resolution)
+    ts = shift * u / (1 + (shift - 1) * u)
     q_ids, q_mask = tokenize(qwen_tok, texts_en)
     states = stage.lm_states
     lm_full = torch.cat(states) if states is not None else None  # (B, L, H)
@@ -785,7 +794,8 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
         cache.clear()
         cache.update(ids=ids.detach(), ids_cpu=None if ids_cpu is None else ids_cpu.detach(),
                      lm=None if lm_full is None else lm_full.detach(), m=m, chunks=[],
-                     weighting=getattr(args, "opd_state_weighting", False), errors=[], pending=[])
+                     weighting=getattr(args, "opd_state_weighting", False), errors=[], pending=[],
+                     resolution=resolution, time_shift=shift)
     rep = lambda a: a.repeat_interleave(m, dim=0)
     def train_part(item):
         b0, b1, x, t, h = item
@@ -925,6 +935,7 @@ def rollout_actor_server(stage, named, te_cfg, den_cfg, args, lm_server_rank, te
     tokenizer = klein_tokenizer(args.klein)
 
     def generate(job):
+        from aurora.opd_resolution import batch_resolution
         ids_cpu, mb = job["ids"], job["mb"]
         ids = ids_cpu.to(device)
         full = lm.collect(lm.request(ids_cpu))
@@ -933,7 +944,9 @@ def rollout_actor_server(stage, named, te_cfg, den_cfg, args, lm_server_rank, te
         rng = torch.Generator(device=device).manual_seed(seed)
         # Match next_batch's RNG consumption before its initial noise draw.
         torch.randn(len(ids), device=device, generator=rng)
-        eps = torch.randn(len(ids), den_cfg.latent_channels, den_cfg.latent_size, den_cfg.latent_size,
+        side = (batch_resolution(args, job["step"]) // 16
+                if getattr(args, "opd_resolutions", ()) else den_cfg.latent_size)
+        eps = torch.randn(len(ids), den_cfg.latent_channels, side, side,
                           device=device, generator=rng)
         cache = {}
         generation_start = time.perf_counter()
@@ -998,6 +1011,10 @@ def main():
     args = resolve_defaults(get_args())
     assert not (args.diffusion_opd and args.dance_opd), "--diffusion-opd or --dance-opd, not both"
     args.opd = args.diffusion_opd or args.dance_opd  # the on-policy distillation path (opd_step) for either
+    from aurora.opd_resolution import validate as validate_opd_resolution, batch_resolution, time_shift as opd_time_shift
+    validate_opd_resolution(args)
+    if args.opd_resolutions:
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
     assert args.opd_reuse >= 1, "--opd-reuse must be >= 1"
     assert args.opd or args.opd_reuse == 1, "--opd-reuse needs OPD"
     assert not args.opd_state_weighting or (args.opd and args.opd_reuse > 1), "--opd-state-weighting needs OPD reuse > 1"
@@ -1545,6 +1562,13 @@ def main():
         flops_sample += 6 * sum(p.numel() for p in te.parameters()) * Tt
         if getattr(te, "lm", None) is not None:
             flops_sample += 2 * sum(p.numel() for p in te.lm.parameters()) * Tt
+    opd_flops = {}
+    for r in args.opd_resolutions:
+        tokens = (r // 16) ** 2
+        # Training forward/backward only; rollout and teacher work are excluded.
+        opd_flops[r] = args.opd_states * (
+            6 * n_den * tokens + 12 * den_cfg.depth * den_cfg.dim * tokens * (tokens + Tt)
+            + 6 * sum(p.numel() for p in te.parameters()) * Tt)
     peak = args.peak_tflops or (peak_tflops(torch.cuda.get_device_name(device)) if device.type == "cuda" else 0)
 
     wb = None
@@ -1664,6 +1688,10 @@ def main():
             f"step {repa_steps}; decoding spread over all {pp} stages")
     log(f"resolution {args.res} px ({den_cfg.latent_size}x{den_cfg.latent_size} latents, {lat_kind}), t shift "
         + (f"res / {args.t_shift_ref:g}" if args.t_shift_ref else f"{args.t_shift:.2f}"))
+    if args.opd_resolutions:
+        log("OPD resolution per fresh batch (constant through replay): " + ", ".join(
+            f"{r}px TS {opd_time_shift(args, r):g}, batch weight {w:g}" for r, w in zip(
+                args.opd_resolutions, args.opd_res_weights or [1] * len(args.opd_resolutions))))
     if mr_groups:
         log("multi-res per replica and step: " + ", ".join(
             f"{r} px {n} x {k} ({n * k * (r // 16) ** 2:,} tokens, t shift "
@@ -1783,11 +1811,15 @@ def main():
             got = got[:-1] if has_cond else got
             lat, ids, rows = got if args.opd else (*got, None)
         ids_cpu = ids
-        shape = (per_pipe, den_cfg.latent_channels, den_cfg.latent_size, den_cfg.latent_size)
+        side = batch_resolution(args, at) // 16 if args.opd_resolutions else den_cfg.latent_size
+        shape = (per_pipe, den_cfg.latent_channels, side, side)
         if mr_groups:
             return multi_res_batch(at, lat, ids, ids_cpu, rows, mcond)
         with profile.phase("vae_encode"):
-            if vae_client is not None and encoder is not None and round(args.vae_remote_frac * per_pipe) > 0:
+            if args.opd_resolutions:
+                # OPD targets come from the teacher on student states, not real-image latents.
+                x0 = torch.zeros(shape, device=device)
+            elif vae_client is not None and encoder is not None and round(args.vae_remote_frac * per_pipe) > 0:
                 # a handle (the first k images on the server, the rest here); the main loop collects it
                 u8 = lat.to(device, non_blocking=True)
                 k = round(args.vae_remote_frac * per_pipe)
@@ -1847,6 +1879,7 @@ def main():
         actor_snapshot_step = step
         actor_snapshot_seconds += time.perf_counter() - snapshot_start
     opd_acc = torch.zeros(4, device=device)  # fresh loss/count, replay loss/count
+    flops_window = 0.0
     pending = None  # --lm-rank: the next step's batch and its LM request, sent while the current step trains
     # all training ranks enter step 1 together: stages without data / validation work would otherwise start the
     # pipeline's first p2p (NCCL communicator setup) long before stage 0 is ready
@@ -1966,6 +1999,7 @@ def main():
                 finally:
                     stage_mod.lm_states = saved_states
                 del nb, request, future_lm, saved_states
+        active_opd_res = (opd_cache["resolution"] if prepared or replay else eps.shape[-1] * 16) if args.opd else args.res
         stage_mod.repa_targets = None
         if step < repa_steps and step % args.repa_every == 0:
             n_repa = max(1, round(args.repa_frac * mb))
@@ -2085,6 +2119,7 @@ def main():
                 dump_snapshot("OOM")
                 raise
         step += 1
+        flops_window += opd_flops.get(active_opd_res, flops_sample)
         if args.opd:
             opd_pass += 1
         if args.mem_debug and step <= 3:
@@ -2126,6 +2161,8 @@ def main():
                 opd_acc.zero_()
                 stats.update({"opd/reuse_pass": opd_pass, "opd/fresh_batches": opd_batches,
                               "opd/fresh_trajectories": opd_batches * args.batch})
+                stats.update({"opd/resolution": active_opd_res,
+                              "opd/time_shift": opd_time_shift(args, active_opd_res)})
             if actor_client is not None:
                 stats["opd/actor_step"] = opd_cache["actor_step"]
                 stats["opd/actor_age"] = step - 1 - opd_cache["actor_step"]
@@ -2166,11 +2203,13 @@ def main():
             stamp = time.time()
             dt = stamp - t0
             stats.update(steps_per_s=n / dt, imgs_per_s=n * args.batch / dt,
-                         tflops_per_gpu=flops_sample * args.batch * n / dt / world / 1e12)
+                         tflops_per_gpu=flops_window * args.batch / dt / world / 1e12)
             if peak:
                 stats["mfu"] = stats["tflops_per_gpu"] / peak
                 mfu = f" MFU {stats['mfu']:.0%}"
             opd_s = f" | OPD {'replay' if replay else 'prefetched' if prepared else 'fresh'} {opd_pass}/{args.opd_reuse}" if args.opd else ""
+            if args.opd_resolutions:
+                opd_s += f" {active_opd_res}px TS {opd_time_shift(args, active_opd_res):g}"
             if actor_client is not None:
                 opd_s += (f" | actor v{opd_cache['actor_step']} age {step - 1 - opd_cache['actor_step']}"
                           f" wait {actor_wait_seconds:.2f}s sync {actor_snapshot_seconds:.2f}s")
@@ -2181,6 +2220,7 @@ def main():
             if wb:
                 wb.log(stats, step=step)
             acc.zero_()
+            flops_window = 0.0
             t0, t_last = stamp, step
 
         profile.end_step(step)

@@ -210,6 +210,34 @@ Plansze do późniejszego blind testu powinny zawierać tylko obraz i pełny pro
 bezpośrednio pod nim. Nazwy modeli, seedy i parametry pozostają poza planszami;
 manifestów nie udostępniamy oceniającym. Skrypt generuje obrazy źródłowe, nie plansze.
 
+## DanceOPD / DiffusionOPD w wielu rozdzielczościach
+
+W `train_pp.py` ustaw `--res 1024 --t-shift 6`,
+`--opd-resolutions 256 512 1024` i `--opd-res-shifts 1.5 3 6`.
+To osobna ścieżka od `--multi-res`, które miesza obrazy w jednym kroku zwykłego treningu FM.
+W OPD jedna rozdzielczość jest losowana na świeży batch trajektorii i pozostaje
+niezmienna przez wszystkie aktualizacje `--opd-reuse`. Batch i microbatch mają
+stałą liczbę obrazów, dobraną do największej rozdzielczości.
+
+`--opd-res-weights 1 1 1` (domyślne) oznacza równe prawdopodobieństwa batchów,
+**nie** równe udziały tokenów: przy stałym batchu udziały tokenów wynoszą średnio
+1:4:16. Można podać inne dodatnie wagi. Bez `--opd-res-shifts` przesunięcie wynosi
+`res / --t-shift-ref`, jeśli ref ustawiono, w przeciwnym razie
+`--t-shift * res / --res`.
+
+Wszystkie repliki wybierają tę samą rozdzielczość na podstawie seedu i kroku
+docelowego batcha. Działają zarówno lokalne rollouty, `--opd-prefetch`, jak
+i osobny `--opd-actor`. Cache przenosi rozdzielczość i time shift; po wznowieniu
+cache jest generowany na nowo, tak jak w dotychczasowym OPD.
+Teacher otrzymuje rozmiar latentów w każdym żądaniu; RoPE i micro-conditioning
+ucznia wynikają z rozmiaru wejścia. Log pokazuje bieżące `opd/resolution`
+i `opd/time_shift`, a TFLOPS uwzględniają rozdzielczości i liczbę stanów
+trenowanych w oknie logowania (bez kosztu rolloutu i teachera).
+Wymagane `--pp 1`; nie łączyć z `--multi-res`, `--crop-res` ani REPA.
+Pierwsze wystąpienie każdej rozdzielczości może wymagać kompilacji nowych grafów.
+
+Test CPU: `PYTHONPATH=. python tests/check_opd_resolution.py`.
+
 ## Struktura
 
 | plik | co robi |
