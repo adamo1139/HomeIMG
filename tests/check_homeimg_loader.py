@@ -27,14 +27,16 @@ class TinyPipeline(DiffusionPipeline):
 '''
 root=Path(tempfile.mkdtemp(prefix='homeimg_loader_check_'))
 sentinel=object(); sys.modules['pipeline']=sentinel
-for i in range(2):
+for i in range(4):
     folder=root/str(i); folder.mkdir()
     (folder/'pipeline.py').write_text(source)
     (folder/'model_index.json').write_text(json.dumps({'_class_name':'TinyPipeline','transformer':['pipeline','Tiny']}))
     tiny=Tiny(); tiny.weight.data.fill_(i+1); tiny.save_pretrained(folder/'transformer')
+    if i >= 2:
+        (folder/'transformer'/'pipeline.py').write_text(source)
     loaded=load_homeimg_pipeline(folder)
     assert torch.equal(loaded.transformer.weight, tiny.weight)
     assert sys.modules['pipeline'] is sentinel
     if i==0: first_class=type(loaded)
     else: assert type(loaded) is not first_class
-print('PASS: real Diffusers component loading, weights, export isolation and alias restoration')
+print('PASS: root and component custom code, weights, export isolation and alias restoration')

@@ -17,6 +17,9 @@ def load_homeimg_pipeline(root, **kwargs):
     code. Each export gets a distinct module; the legacy 'pipeline' alias is
     scoped to loading so sequential model loads cannot reuse another export.
     """
+    if kwargs.get("trust_remote_code") is False:
+        raise ValueError("HomeIMG exports require executing trusted pipeline.py code")
+    kwargs["trust_remote_code"] = True
     root = Path(root).resolve()
     source = root / "pipeline.py"
     index = json.loads((root / "model_index.json").read_text())
