@@ -25,6 +25,7 @@ from aurora.repa import REPATarget
 from aurora.slayer import LM_PAD
 from prepare_data import ENCODERS
 from sample import PROMPTS, PROMPTS_PL
+from homeimg_loader import load_homeimg_pipeline
 
 
 
@@ -78,10 +79,10 @@ def load(src, raw=False, res=None, rope_ref=None):
 
 def sample_pipeline_export(a, root):
     """Load self-contained Diffusers exports using their exported model classes."""
-    from diffusers import DiffusionPipeline, AutoencoderKLFlux2
+    from diffusers import AutoencoderKLFlux2
     if a.raw or a.export:
         raise ValueError("--raw / --export require a .pt checkpoint; an HF export already contains selected weights")
-    pipe = DiffusionPipeline.from_pretrained(root, custom_pipeline=root, trust_remote_code=True)
+    pipe = load_homeimg_pipeline(root)
     if a.vae is not None:
         pipe.vae = AutoencoderKLFlux2.from_pretrained(a.vae)
     pipe.to("cuda")

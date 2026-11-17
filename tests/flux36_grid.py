@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aurora import fid as fidlib  # noqa: E402
 from aurora.repa import REPATarget  # noqa: E402
 from sample_ckpt import load, tokenize  # noqa: E402
+from homeimg_loader import load_homeimg_pipeline  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -60,8 +61,8 @@ def main():
             from huggingface_hub import snapshot_download
             root = snapshot_download(root)
         if os.path.isfile(os.path.join(root, "model_index.json")):
-            from diffusers import DiffusionPipeline, AutoencoderKLFlux2
-            pipe = DiffusionPipeline.from_pretrained(root, custom_pipeline=root, trust_remote_code=True)
+            from diffusers import AutoencoderKLFlux2
+            pipe = load_homeimg_pipeline(root)
             if a.vae:
                 pipe.vae = AutoencoderKLFlux2.from_pretrained(a.vae)
             pipe.to("cuda")
