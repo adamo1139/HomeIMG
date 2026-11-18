@@ -776,12 +776,13 @@ def local_train_step(stage, z, t, ids, target, microbatch, losses, widths=None, 
 
 
 @torch.no_grad()
-def opd_rollout(stage, z, ids, lm_states, mb, ts, picks, widths=None):
+def opd_rollout(stage, z, ids, lm_states, mb, ts, picks, widths=None, timings=None):
     """The student's own Euler trajectories from noise z (B, C, h, w): conditional velocity (no CFG) for the
     captions ids (lm_states: their (B, L, H) LM states or None), time grid ts (K + 1,), in micro-batches of mb; the
     text encoder runs once per micro-batch, not once per step. -> states (B, m, C, h, w) at the step indices picks
     (B, m) (CPU). Each fixed-size micro-batch stops at its last queried state; no forward is needed
     at that state. Keeping micro-batch shapes fixed avoids extra compilation variants."""
+    from contextlib import nullcontext
     B, m = picks.shape
     chunks = []
     for j in range(0, B, mb):
@@ -803,7 +804,12 @@ def opd_rollout(stage, z, ids, lm_states, mb, ts, picks, widths=None):
                 if k >= last:
                     continue
                 stage.text_cache = cache
-                v = stage(z[sl], ts[k].expand(ids_j.shape[0]), ids_j).float()
+                t = ts[k].expand(ids_j.shape[0])
+                with timings.measure("denoiser_forward") if timings is not None else nullcontext():
+                    v = stage(z[sl], t, ids_j)
+                if timings is not None:
+                    timings.rollout_forwards += 1
+                v = v.float()
                 z[sl] = z[sl] + (ts[k + 1] - ts[k]) * v
     finally:
         stage.text_cache = None
@@ -890,7 +896,7 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
             widths = text_widths(ids_c, mb, args.text_bucket) if ids_c is not None and args.text_bucket else None
             with phase("rollout"):
                 x = opd_rollout(stage, eps[b0:b1], ids[b0:b1], lm_full[b0:b1] if lm_full is not None else None, mb, ts,
-                                picks[b0:b1], widths).flatten(0, 1)
+                                picks[b0:b1], widths, timings=None if prepare_only else timings).flatten(0, 1)
             t = ts[picks[b0:b1].to(eps.device)].flatten()
             cap = torch.arange(b1 - b0, device=eps.device).repeat_interleave(m)
             with phase("teacher_request"):
@@ -2331,7 +2337,11 @@ def main():
         if step % args.log_every == 0 or step == args.steps:
             if learner_timing is not None:
                 times = learner_timing.finish()
+                calls = learner_timing.rollout_forwards
+                span = times.get("denoiser_forward_cuda_span")
+                mean_ms = f"{1000 * span / calls:.2f}" if calls and span is not None else "n/a"
                 print(f"[learner profile] step {step} rank {rank} {active_opd_res}px "
+                      f"rollout_forwards={calls} denoiser_ms_per_forward={mean_ms} "
                       + " ".join(f"{key}={value:.3f}s" for key, value in times.items()), flush=True)
             dist.all_reduce(acc, group=train_group)
             n = step - t_last

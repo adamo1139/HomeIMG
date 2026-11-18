@@ -25,6 +25,7 @@ class ActorTimings:
     def __init__(self, device):
         self.device = device
         self.wall, self.events = {}, []
+        self.rollout_forwards = 0
 
     @contextmanager
     def measure(self, name):
