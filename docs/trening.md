@@ -1,5 +1,7 @@
 # Trening HomeIMG
 
+[English](training.md)
+
 Wykonuj komendy z głównego katalogu repozytorium. Pierwsza receptura korzysta z gotowych latentów 256 px i uruchamia trening małego DiT na ośmiu GPU. Domyślny wycinek danych zajmuje około 39 GB; osobno przewidź miejsce na konwersję i checkpointy.
 
 ## Środowisko (osobny venv)

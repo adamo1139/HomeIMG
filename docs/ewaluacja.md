@@ -1,5 +1,7 @@
 # Ewaluacja jakości obrazów
 
+[English](evaluation.md)
+
 ## Polski test porównawczy HomeIMG (22 prompty)
 
 Treść promptów: [`tests/homeimg22_pl.json`](../tests/homeimg22_pl.json).

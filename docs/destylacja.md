@@ -1,5 +1,7 @@
 # Destylacja HomeIMG
 
+[English](distillation.md)
+
 ## DanceOPD / DiffusionOPD w wielu rozdzielczościach
 
 W `train_pp.py` ustaw `--res 1024 --t-shift 6`,

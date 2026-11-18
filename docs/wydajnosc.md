@@ -1,5 +1,7 @@
 # Wydajność i komunikacja między GPU
 
+[English](performance.md)
+
 ## NCCL na kartach GeForce
 
 Najpierw sprawdzić samą komunikację między kartami (kilka sekund, bez danych i modelu):

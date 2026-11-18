@@ -1,5 +1,7 @@
 # HomeIMG
 
+[English](README_en.md)
+
 **Polsko-angielskie modele do generowania obrazów i kod do ich treningu.** HomeIMG rozwijam samodzielnie, od pierwszych eksperymentów z małym transformatorem dyfuzyjnym po dwujęzyczny model z denoiserem 1,24 mld parametrów. Tutaj udostępniam kod przygotowania danych, treningu, destylacji i oceny. Gotowe wagi EMA publikuję na Hugging Face.
 
 [Wagi na Hugging Face](https://huggingface.co/cpral?search_models=HomeIMG) · [Wygeneruj obraz](#wygeneruj-obraz) · [Wytrenuj model](docs/trening.md) · [Porównaj checkpointy](docs/ewaluacja.md)
