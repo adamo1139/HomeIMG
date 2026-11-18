@@ -202,6 +202,8 @@ def get_args():
                    help="relative probabilities of fresh batches, NOT token proportions; default: equal")
     p.add_argument("--opd-token-batch", action="store_true",
                    help="scale images per rollout batch by round((res_max/res)^2); --batch is the largest-resolution batch")
+    p.add_argument("--opd-res-mb", type=int, nargs="+", default=[],
+                   help="images per microbatch for each OPD resolution, used by actor and learners; e.g. 16 8 2")
     p.add_argument("--opd-res-shifts", type=float, nargs="+", default=[],
                    help="time shifts per OPD resolution; e.g. 1.5 3 6; default: res / t-shift-ref or t-shift * res / res_max")
     p.add_argument("--keep-ckpt-steps", type=int, nargs="*", default=[],
@@ -1014,7 +1016,8 @@ def main():
     assert not (args.diffusion_opd and args.dance_opd), "--diffusion-opd or --dance-opd, not both"
     args.opd = args.diffusion_opd or args.dance_opd  # the on-policy distillation path (opd_step) for either
     from aurora.opd_resolution import (validate as validate_opd_resolution, batch_resolution,
-                                       time_shift as opd_time_shift, batch_multiplier, gather_caption_batches)
+                                       time_shift as opd_time_shift, batch_multiplier, gather_caption_batches,
+                                       microbatch_size, validate_microbatches)
     validate_opd_resolution(args)
     if args.opd_resolutions:
         torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
@@ -1120,6 +1123,9 @@ def main():
     assert per_pipe * replicas == args.batch and (mr_groups or per_pipe % M == 0), \
         f"batch {args.batch} must split into {replicas} pipelines x {M} micro-batches"
     mb = per_pipe // M
+    base_mb = mb
+    if args.opd_resolutions:
+        validate_microbatches(args, per_pipe, base_mb)
     # inner lrs: AdamW groups scaled to the batch each optimizer sees (the pipeline's batch with MuLoCo)
     args.lr_scale = 1.0 if args.no_lr_batch_scaling else math.sqrt((per_pipe if args.diloco else args.batch) / 256)
     args.mlm_weight = 0.0
@@ -1700,7 +1706,8 @@ def main():
         + (f"res / {args.t_shift_ref:g}" if args.t_shift_ref else f"{args.t_shift:.2f}"))
     if args.opd_resolutions:
         log("OPD resolution per fresh batch (constant through replay): " + ", ".join(
-            f"{r}px TS {opd_time_shift(args, r):g}, batch {args.batch * batch_multiplier(args, r)}, weight {w:g}" for r, w in zip(
+            f"{r}px TS {opd_time_shift(args, r):g}, batch {args.batch * batch_multiplier(args, r)}, "
+            f"mb {microbatch_size(args, r, base_mb)}, weight {w:g}" for r, w in zip(
                 args.opd_resolutions, args.opd_res_weights or [1] * len(args.opd_resolutions))))
     if mr_groups:
         log("multi-res per replica and step: " + ", ".join(
@@ -1880,7 +1887,8 @@ def main():
             got = got[:-1]
         _, token_ids, caption_rows = got
         actor_client.request(dict(ids=token_ids.cpu(), texts=captions_en(caption_rows.tolist()),
-                                  step=at, replica=replica, mb=mb))
+                                  step=at, replica=replica,
+                                  mb=microbatch_size(args, batch_resolution(args, at), base_mb)))
 
     def refresh_actor():
         # Rank zero's complete denoiser + trainable refiner, after its preceding optimizer update.
@@ -1907,6 +1915,10 @@ def main():
         actor_wait_seconds = actor_snapshot_seconds = 0.0
         replay = args.opd and bool(opd_cache) and opd_pass < args.opd_reuse
         prepared = not replay and opd_next is not None
+        if args.opd:
+            resolution = (opd_cache["resolution"] if replay else
+                          opd_next["resolution"] if prepared else batch_resolution(args, step))
+            mb = microbatch_size(args, resolution, base_mb)
         if actor_client is not None and not replay:
             if actor_client.pending is None:
                 refresh_actor()
@@ -2008,12 +2020,13 @@ def main():
                 nb = next_batch(future_step)
                 request = lm_client.request(nb[5])
                 future_lm = lm_client.collect(request)
-                stage_mod.lm_states = list(future_lm.split(mb))
+                future_mb = microbatch_size(args, batch_resolution(args, future_step), base_mb)
+                stage_mod.lm_states = list(future_lm.split(future_mb))
                 opd_next = {}
                 try:
                     with amp:
                         opd_step(stage_mod, teacher_client, qwen_tok, captions_en(nb[6].tolist()), nb[3], nb[4],
-                                 nb[5], mb, args, future_step, replica, [], parts=args.opd_parts,
+                                 nb[5], future_mb, args, future_step, replica, [], parts=args.opd_parts,
                                  cache=opd_next, prepare_only=True)
                 finally:
                     stage_mod.lm_states = saved_states
@@ -2234,7 +2247,7 @@ def main():
                 mfu = f" MFU {stats['mfu']:.0%}"
             opd_s = f" | OPD {'replay' if replay else 'prefetched' if prepared else 'fresh'} {opd_pass}/{args.opd_reuse}" if args.opd else ""
             if args.opd_resolutions:
-                opd_s += f" {active_opd_res}px TS {opd_time_shift(args, active_opd_res):g} batch {active_batch}"
+                opd_s += f" {active_opd_res}px TS {opd_time_shift(args, active_opd_res):g} batch {active_batch} mb {mb}"
             if actor_client is not None:
                 opd_s += (f" | actor v{opd_cache['actor_step']} age {step - 1 - opd_cache['actor_step']}"
                           f" wait {actor_wait_seconds:.2f}s sync {actor_snapshot_seconds:.2f}s")

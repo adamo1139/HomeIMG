@@ -5,6 +5,10 @@ import random
 
 def validate(args):
     resolutions = args.opd_resolutions
+    microbatches = getattr(args, "opd_res_mb", ())
+    if microbatches and (not resolutions or len(microbatches) != len(resolutions) or
+                         any(v <= 0 for v in microbatches)):
+        raise ValueError("--opd-res-mb needs one positive image microbatch per OPD resolution")
     if not resolutions:
         if getattr(args, "opd_token_batch", False):
             raise ValueError("--opd-token-batch needs --opd-resolutions")
@@ -52,6 +56,22 @@ def time_shift(args, resolution):
 def batch_multiplier(args, resolution):
     """Whole base batches keep replica / microbatch / OPD-part divisibility intact."""
     return max(1, round((args.res / resolution) ** 2)) if getattr(args, "opd_token_batch", False) else 1
+
+
+def microbatch_size(args, resolution, default):
+    values = getattr(args, "opd_res_mb", ())
+    return values[args.opd_resolutions.index(resolution)] if values else default
+
+
+def validate_microbatches(args, per_pipe, default):
+    """Both rollout trajectories and training states must fill complete microbatches."""
+    for resolution in args.opd_resolutions:
+        n = per_pipe * batch_multiplier(args, resolution)
+        mb = microbatch_size(args, resolution, default)
+        part = (n + args.opd_parts - 1) // args.opd_parts
+        if any(min(part, n - start) % mb for start in range(0, n, part)):
+            raise ValueError(f"OPD {resolution}px: {n} images per learner split into "
+                             f"{args.opd_parts} parts must fill microbatch {mb}")
 
 
 def gather_caption_batches(loader, count, has_cond=False):

@@ -68,6 +68,8 @@ print('Replay: 8 AdamW updates match independent recomputation exactly, includin
 # Execute the real data-preparation gate from main with a mocked loader.
 main=next(n for n in ast.parse(source).body if getattr(n,'name','')=='main')
 loop=next(n for n in main.body if isinstance(n,ast.While))
+loop.body = [n for n in loop.body if not (isinstance(n, ast.If) and
+             ast.unparse(n.test) == 'args.opd' and 'microbatch_size' in ast.unparse(n))]
 a=next(i for i,n in enumerate(loop.body) if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='replay' for t in n.targets))
 code=compile(ast.Module(body=loop.body[a:a+5],type_ignores=[]),'<main-data-gate>','exec')
 for resume in (0,5,8):

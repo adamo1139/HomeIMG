@@ -44,6 +44,8 @@ print('Prepared cache: no backward/collection during generation; exact gradients
 
 main=next(n for n in ast.parse(src).body if getattr(n,'name','')=='main')
 loop=next(n for n in main.body if isinstance(n,ast.While))
+loop.body = [n for n in loop.body if not (isinstance(n, ast.If) and
+             ast.unparse(n.test) == 'args.opd' and 'microbatch_size' in ast.unparse(n))]
 a=next(i for i,n in enumerate(loop.body) if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='replay' for t in n.targets))
 gate=compile(ast.Module(body=loop.body[a:a+5],type_ignores=[]),'<gate>','exec')
 prefetch=next(n for n in loop.body if isinstance(n,ast.If) and 'opd_prefetch' in ast.unparse(n.test))
