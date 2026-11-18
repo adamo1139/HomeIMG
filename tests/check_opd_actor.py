@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 from aurora.opd_actor import RolloutClient, cache_to_device, serve_rollouts
 
 
-def worker(rank, path, started, release):
+def worker(rank, path, started, release, captured, actor_ready, request_submitted):
     torch.set_num_threads(1)
     dist.init_process_group('gloo', init_method=f'file://{path}', rank=rank, world_size=3,
                             timeout=datetime.timedelta(seconds=45))
@@ -26,6 +26,10 @@ def worker(rank, path, started, release):
     q = torch.nn.Parameter(torch.zeros(2, dtype=torch.bfloat16))
     named = [('den', 'w', p), ('te', 'w', q)]
     if rank == 2:
+        # Deliberately prevent snapshot installation: capture/enqueue must return
+        # without the actor receiving anything or the optimizer waiting on it.
+        assert captured.wait(30)
+        actor_ready.set()
         def generate(job):
             who = job['rank']
             started[who].set()
@@ -37,13 +41,28 @@ def worker(rank, path, started, release):
     else:
         client = RolloutClient(2, group)
         for version in (3, 11):
+            if rank == 1:
+                client.request(dict(ids=torch.ones(1, 2, dtype=torch.long), rank=rank, actor_step=version))
+                request_submitted.set()
             if rank == 0:
+                assert request_submitted.wait(30)
                 with torch.no_grad():
                     p.fill_(version)
                     q.fill_(version + 1)
-                client.update(named, version)
-            dist.barrier(group=learners)
-            client.request(dict(ids=torch.ones(1, 2, dtype=torch.long), rank=rank))
+                client.update_async(named, version)
+                with torch.no_grad():
+                    p.fill_(-999)  # mutate live weights before installation completes
+                    q.fill_(-999)
+                if version == 3:
+                    assert not client.snapshot_pending.done()
+                    try:
+                        client.update_async(named, version + 1)
+                        raise AssertionError('second outstanding snapshot accepted')
+                    except RuntimeError:
+                        pass
+                    captured.set()
+                    assert actor_ready.wait(30)
+                client.request(dict(ids=torch.ones(1, 2, dtype=torch.long), rank=rank, actor_step=version))
             try:
                 client.request({})
                 raise AssertionError('second outstanding request accepted')
@@ -69,6 +88,9 @@ def worker(rank, path, started, release):
             started[rank].clear()
             release[rank].clear()
             dist.barrier(group=learners)
+            if rank == 0:
+                request_submitted.clear()
+            dist.barrier(group=learners)
         client.stop()
     dist.destroy_process_group()
 
@@ -77,6 +99,8 @@ def check_schedule():
     src = (ROOT / 'train_pp.py').read_text()
     main = next(n for n in ast.parse(src).body if getattr(n, 'name', '') == 'main')
     loop = next(n for n in main.body if isinstance(n, ast.While))
+    loop.body = [n for n in loop.body if not (isinstance(n, ast.If) and
+                 ast.unparse(n.test) == 'args.opd' and 'microbatch_size' in ast.unparse(n))]
     a = next(i for i, n in enumerate(loop.body) if isinstance(n, ast.Assign)
              and any(isinstance(t, ast.Name) and t.id == 'replay' for t in n.targets))
     gate = compile(ast.Module(body=loop.body[a:a+5], type_ignores=[]), '<actor gate>', 'exec')
@@ -123,6 +147,8 @@ if __name__ == '__main__':
     ctx = mp.get_context('spawn')
     started = [ctx.Event(), ctx.Event()]
     release = [ctx.Event(), ctx.Event()]
+    captured, actor_ready, request_submitted = ctx.Event(), ctx.Event(), ctx.Event()
     with tempfile.TemporaryDirectory() as tmp:
-        mp.spawn(worker, args=(str(Path(tmp) / 'rendezvous'), started, release), nprocs=3, join=True)
-    print('3 real Gloo processes: asynchronous cache receipt, two exact snapshots, queue bound, age rejection and shutdown passed')
+        mp.spawn(worker, args=(str(Path(tmp) / 'rendezvous'), started, release,
+                              captured, actor_ready, request_submitted), nprocs=3, join=True)
+    print('3 real Gloo processes: async immutable snapshots, version-gated requests, cache receipt, queue bound, age rejection and shutdown passed')

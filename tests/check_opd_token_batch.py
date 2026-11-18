@@ -76,7 +76,7 @@ request_node = next(n for n in main.body if getattr(n, "name", "") == "request_a
 jobs = []
 env.update(actor_client=SimpleNamespace(request=jobs.append),
            captions_en=lambda rows: ["x"] * len(rows), mb=99, base_mb=1,
-           microbatch_size=microbatch_size)
+           microbatch_size=microbatch_size, actor_snapshot_step=0)
 exec(compile(ast.Module(body=[request_node], type_ignores=[]), "<request_actor>", "exec"), env)
 env["loader"] = stream()
 for step in steps:

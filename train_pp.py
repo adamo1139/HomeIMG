@@ -1879,6 +1879,8 @@ def main():
         actor_client = RolloutClient(actor_rank, actor_group)
         log(f"OPD actor rank {actor_rank}: snapshots from learner rank 0, reuse {args.opd_reuse}, "
             f"fresh snapshot each cycle; maximum cached-state age {2 * args.opd_reuse - 1} updates; one-batch CPU queue")
+        log("OPD actor snapshots: immutable CPU capture, asynchronous transfer/install; "
+            "sync timer includes capture/barriers only, unfinished preparation appears in wait")
 
     def request_actor(at):
         # Only captions are sent to the actor. Do not run VAE/LM in the learner training loop.
@@ -1887,7 +1889,7 @@ def main():
             got = got[:-1]
         _, token_ids, caption_rows = got
         actor_client.request(dict(ids=token_ids.cpu(), texts=captions_en(caption_rows.tolist()),
-                                  step=at, replica=replica,
+                                  step=at, replica=replica, actor_step=actor_snapshot_step,
                                   mb=microbatch_size(args, batch_resolution(args, at), base_mb)))
 
     def refresh_actor():
@@ -1899,7 +1901,9 @@ def main():
         # the policy: every shard of a global cache must use the same snapshot.
         dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
         if master and actor_snapshot_step != step:
-            actor_client.update(named, step)
+            actor_client.update_async(named, step)
+        # This barrier only waits for immutable CPU capture and enqueue. Actor
+        # requests carry the required version; no learner waits for its install.
         dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
         actor_snapshot_step = step
         actor_snapshot_seconds += time.perf_counter() - snapshot_start

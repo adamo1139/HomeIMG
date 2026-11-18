@@ -39,6 +39,7 @@ class RolloutClient:
         self.server, self.group = server, group
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="opd-actor-io")
         self.pending = None
+        self.snapshot_pending = None
 
     def request(self, payload):
         if self.pending is not None:
@@ -47,6 +48,8 @@ class RolloutClient:
         self.pending = self.pool.submit(self._request, payload)
 
     def _request(self, payload):
+        if self.snapshot_pending is not None:
+            self.snapshot_pending.result()  # surface an install/ACK failure before requesting work
         dist.send(torch.tensor([1, 0]), self.server, group=self.group, tag=HEADER)
         dist.send_object_list([payload], self.server, group=self.group)
         result = [None]
@@ -74,9 +77,27 @@ class RolloutClient:
         if int(ack[0]) != step:
             raise RuntimeError("Rollout snapshot acknowledgement mismatch")
 
+    def update_async(self, named, step):
+        """Freeze CPU storage before returning; the worker never reads live parameters.
+
+        Snapshot capture intentionally blocks the main thread until D2H completes.
+        Only transport/install/ACK overlap subsequent optimizer updates.
+        """
+        if self.snapshot_pending is not None:
+            if not self.snapshot_pending.done():
+                raise RuntimeError("Only one outstanding actor snapshot is allowed")
+            self.snapshot_pending.result()
+        if self.pending is not None:
+            raise RuntimeError("Collect the previous rollout before updating the actor")
+        snapshot = [(kind, name, p.detach().to(device="cpu", copy=True).contiguous())
+                    for kind, name, p in named]
+        self.snapshot_pending = self.pool.submit(self.update, snapshot, step)
+
     def stop(self):
         if self.pending is not None:
             self.collect()
+        if self.snapshot_pending is not None:
+            self.snapshot_pending.result()
         self.pool.shutdown(wait=True)
         dist.send(torch.tensor([0, 0]), self.server, group=self.group, tag=HEADER)
 
@@ -84,7 +105,21 @@ class RolloutClient:
 def serve_rollouts(named, clients, group, generate):
     """Single GPU owner; generation never races with a weight replacement."""
     active, version = set(clients), None
+    queued = {}
     while active:
+        # Other learners can submit before rank zero's snapshot arrives. Receive
+        # their payloads but never generate with an older policy than requested.
+        ready = next((src for src, job in queued.items()
+                      if version is not None and job.get("actor_step", version) == version), None)
+        if ready is not None:
+            payload = queued.pop(ready)
+            with torch.no_grad():
+                cache = generate(payload)
+            cache["actor_step"] = version
+            cache = tree_to(cache, "cpu")
+            dist.send_object_list([cache], ready, group=group)
+            del cache, payload
+            continue
         hdr = torch.empty(2, dtype=torch.long)
         src = dist.recv(hdr, group=group, tag=HEADER)
         if src not in active:
@@ -95,6 +130,8 @@ def serve_rollouts(named, clients, group, generate):
         elif kind == 2:
             if src != 0:
                 raise RuntimeError("Only learner rank zero may refresh actor weights")
+            if any(job.get("actor_step", int(hdr[1])) != int(hdr[1]) for job in queued.values()):
+                raise RuntimeError("Snapshot would invalidate queued rollout requests")
             with torch.no_grad():
                 for _, _, p in named:
                     cpu = torch.empty(p.shape, dtype=p.dtype)
@@ -105,13 +142,13 @@ def serve_rollouts(named, clients, group, generate):
         elif kind == 1:
             payload = [None]
             dist.recv_object_list(payload, src, group=group)
-            if version is None:
+            requested = payload[0].get("actor_step", version)
+            if requested is None:
                 raise RuntimeError("Actor must receive initial learner snapshot before requests")
-            with torch.no_grad():
-                cache = generate(payload[0])
-            cache["actor_step"] = version
-            cache = tree_to(cache, "cpu")
-            dist.send_object_list([cache], src, group=group)
-            del cache, payload
+            if version is not None and requested < version:
+                raise RuntimeError("Requested actor snapshot is already obsolete")
+            if src in queued:
+                raise RuntimeError("Only one queued rollout per learner is allowed")
+            queued[src] = payload[0]
         else:
             raise RuntimeError(f"Unknown rollout request {kind}")
