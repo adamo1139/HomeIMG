@@ -1,301 +1,63 @@
-# Trenowanie generatora obrazów
+# HomeIMG
 
-Trening od zera małego modelu text-to-image 256×256 według przepisu
-[AuroraIMG2-50M-Preview](https://huggingface.co/AuroraAI-Research/AuroraIMG2-50M-Preview): latentny flow matching
-(rectified flow) z DiT-em, text encoderem trenowanym razem z nim i zamrożonym dekoderem FLUX.2. Celujemy w 8× RTX 3090 Ti.
+**Polsko-angielskie modele do generowania obrazów i kod do ich treningu.** HomeIMG rozwijam samodzielnie, od pierwszych eksperymentów z małym transformatorem dyfuzyjnym po dwujęzyczny model z denoiserem 1,24 mld parametrów. Tutaj udostępniam kod przygotowania danych, treningu, destylacji i oceny. Gotowe wagi EMA publikuję na Hugging Face.
 
-- Architektura jest 1:1 z oryginałem: opublikowane wagi ładują się w trybie strict i dają identyczny output (`tests/check_model.py`).
-- Rozmiary DiT: `--size 50m` (oryginał), `116m` (768×12), `253m` (1024×16, domyślny). Text encoder: `--te-size 13m`
-  (oryginał, 384×6) albo `27m` (512×8, domyślny). Domyślnie razem ~272M (DiT 245M z szerszym cross-attention + TE 26.7M).
-  Odtworzenie oryginału: `--size 50m --te-size 13m`.
-- Domyślnie **Muon** (lr 1e-2, WD 0.01, jak w oryginale) dla macierzy ukrytych, AdamW dla reszty, stały lr po warmupie
-  + **WSM** (uśrednianie checkpointów zamiast wygaszania lr, `merge.py`). AdamW dla wszystkiego: `--optimizer adamw`.
-  Warianty Muona pod DiT: `--cmuon` ([CMuon](https://arxiv.org/abs/2608.02502): osobna ortogonalizacja bloków
-  macierzy złączonych - q/k/v, k/v cross-attention, gate/up SwiGLU) i `--muon-period 3` ([periodic row-wise
-  Muon](https://arxiv.org/abs/2608.20818): Newton-Schulz co 3. krok, pomiędzy znormalizowane wiersze momentum × 0.15).
-- Dane: [QLNI/FLUX-Reason-6M-flux2-latents](https://huggingface.co/datasets/QLNI/FLUX-Reason-6M-flux2-latents), ~5.6M gotowych latentów (~385 GB).
-  **Domyślnie pobieramy i trenujemy na 10%** (~39 GB), żeby najpierw sprawdzić pomysł; `--fraction 1` = całość.
+[Wagi na Hugging Face](https://huggingface.co/cpral?search_models=HomeIMG) · [Wygeneruj obraz](#wygeneruj-obraz) · [Wytrenuj model](docs/trening.md) · [Porównaj checkpointy](docs/ewaluacja.md)
 
-Pełny plan, uzasadnienie hiperparametrów, szacunki czasu i pamięci: **[PLAN.md](PLAN.md)**.
+![Osiem generacji HomeIMG z polskich promptów](https://huggingface.co/cpral/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048/resolve/main/grids_cfg3/grid_pl_1024px_ts6.png)
 
-## Środowisko (osobny venv)
+*DanceOPD 2048, osiem stałych promptów PL, 1024 × 1024 px, 50 kroków Eulera, CFG 3, time shift 6. [Plansze dla obu języków i ustawienia eksperymentu](model_cards/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048/README.md).*
 
-Trenujemy w osobnym venv w katalogu repo (`.venv/`, ignorowany przez gita), żeby nie mieszać pakietów z systemowym
-Pythonem. Wymagany jest [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
+## Modele i etapy treningu
+
+| Wagi | Co zmieniłem na tym etapie |
+|---|---|
+| [HomeIMG 641M · epoch19](https://huggingface.co/cpral/HomeIMG-641M-PL-EN-epoch19) | Wczesny dwujęzyczny checkpoint. Opisuje przejście od treningu po angielsku do podpisów PL/EN. |
+| [HomeIMG 1.2B · epoch49](https://huggingface.co/cpral/HomeIMG-1.2B-PL-EN-epoch49) | Po treningu progresywnym połączyłem rozdzielczości 256, 512 i 1024 px. |
+| [HomeIMG 1.2B · epoch49.2](https://huggingface.co/cpral/HomeIMG-1.2B-PL-EN-epoch49.2) | Wspólny punkt startowy dwóch gałęzi destylacji: DanceOPD i DiffusionOPD. |
+| [HomeIMG 1.2B · DanceOPD 2048](https://huggingface.co/cpral/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048) | 2048 aktualizacji przy 1024 px z FLUX.2 [klein] base 4B jako teacherem. Z tego wydania pochodzi plansza powyżej. |
+
+W późniejszym eksperymencie połączyłem denoisery z DanceOPD 2048 i DiffusionOPD 3072 metodą ArceeFusion. Po destylacji przy 1024 px zaobserwowałem regresję w niższych rozdzielczościach. Z połączonych wag rozpocząłem więc kolejny trening DanceOPD, losując dla każdego batcha 256, 512 lub 1024 px i wyrównując liczbę tokenów obrazu. Zakończyłem go po 5120 aktualizacjach. [Konfiguracja eksperymentu](docs/destylacja.md).
+
+## Wygeneruj obraz
+
+Na maszynie z GPU NVIDIA, sterownikiem obsługującym CUDA 12.8 i zainstalowanym `uv`:
 
 ```bash
+git clone https://github.com/adamo1139/HomeIMG.git
+cd HomeIMG
 uv venv .venv --python 3.11
 source .venv/bin/activate
-uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128  # najpierw!
+uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
 uv pip install -r requirements.txt
-python -c "import torch; print(torch.__version__, torch.cuda.device_count(), 'GPU')"
+
+hf download cpral/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048 --local-dir exports/homeimg
+python sample_ckpt.py exports/homeimg --out-dir samples --batch 1 \
+  --res 1024 --steps 50 --cfg 3 --t-shift 6 --seed 0 \
+  --prompt "Akwarela przedstawiająca Zamek Królewski na Wawelu widziany znad Wisły."
 ```
 
-Bez uv: `python3.11 -m venv .venv && source .venv/bin/activate && pip install torch --index-url
-https://download.pytorch.org/whl/cu128 && pip install -r requirements.txt`. Wszystkie dalsze komendy zakładają aktywny venv
-(albo wywołanie `.venv/bin/python` / `.venv/bin/torchrun`). Sprawdzone: torch 2.11.0+cu128, diffusers 0.42.1, Python 3.11.
+Obraz znajdziesz w `samples/00.png`. Pominięcie `--prompt` generuje dwie plansze z ośmioma promptami, po polsku i po angielsku. Interfejs przeglądarkowy jest w [app.py](app.py).
 
-## Text encoder: Slayer149 (zamrożony) + REPA z DINOv2-B/14 (domyślnie)
+## Jak działa HomeIMG
 
-- `--te-size slayer149` (domyślnie): zamrożony [SlayerLab/Slayer149](https://huggingface.co/SlayerLab/Slayer149) (149M,
-  angielski) + trenowany refiner: domyślnie 2 bloki o połowie szerokości denoisera (2B: 1024, ~25M; 750m:
-  1280, ~36M; w PP siedzi na stage'u 0, więc większy go spowalnia), `--te-dim` / `--te-depth` zmieniają rozmiar, `--te-dim 768 --te-depth 2` = dawny ~13M
-  (potrzebne do wznowienia starszych runów). Wymaga osobnej tokenizacji captionów (obok istniejącej):
-  `python prepare_data.py tokenize --data data/aurora_full --encoder slayer149`.
-  `--te-size 13m` / `27m` to dawne enkodery trenowane od zera (z MLM).
-- **REPA** (`--repa-weight 0.5`, domyślnie): stan DiT po ~30% głębokości jest dopasowywany (cosinus, przez MLP) do cech
-  [DINOv2-B/14 z rejestrami](https://huggingface.co/timm/vit_base_patch14_reg4_dinov2.lvd142m) (Apache-2.0) z obrazka
-  zdekodowanego z latentu (przeskalowanego do 224 px → siatka 16×16 = tokeny DiT). PE-Spatial-B16:
-  `--repa-encoder vit_pe_spatial_base_patch16_512.fb`. `--irepa` = iREPA (projektor conv 3×3 + normalizacja cech po
-  tokenach). Dekoder jest drogi, więc REPA liczy się tylko dla 25% każdego micro-batcha (`--repa-frac`), co N-ty krok
-  (`--repa-every N`) i przez pierwsze 40% treningu (`--repa-until`). `--repa-weight 0` wyłącza.
-- Eksport (`export.py`) pakuje użyte warstwy Slayer149 i jego tokenizer do repo, a `pipeline.py` (`aurora/hf_pipeline.py`)
-  obsługuje oba enkodery; `tests/check_export.py` sprawdza zgodność z modułami treningowymi.
+W dwujęzycznym HomeIMG zamrożona Poziomka koduje podpis, a trenowany refiner przekształca jej stany w reprezentację tekstu dla denoisera. Transformer dyfuzyjny uczy się pola prędkości w przestrzeni latentnej FLUX.2 metodą flow matching. Podczas generacji solver Eulera prowadzi latent od szumu do obrazu, który dekoduje VAE.
 
-## Szybki start
+W OPD kopia ucznia generuje trajektorie odszumiania. Zamrożony teacher przewiduje prędkość na wybranych stanach tych trajektorii, a uczeń dopasowuje do niej własną predykcję. Kod pozwala rozdzielić trening, generowanie trajektorii i obliczenia teachera między GPU.
 
-```bash
-source .venv/bin/activate
-huggingface-cli download AuroraAI-Research/AuroraIMG2-50M-Preview --local-dir AuroraIMG2-50M-Preview
-
-# dane: pobranie + konwersja do mmap .npy + tokenizacja. Domyślnie 10% datasetu (~39 GB, ~0.57M obrazków);
-# całość (~385 GB): dodać --fraction 1 (już pobrane shardy są pomijane)
-python prepare_data.py convert  --out data/aurora --download --delete-raw --workers 6
-python prepare_data.py tokenize --data data/aurora
-
-# trening na 8 GPU. Domyślnie model 253m, 10% danych, batch 2048 (8 GPU x 64 x akumulacja 4), 3 098 kroków (~11 epok);
-# całość: --fraction 1 (30 976 kroków). OOM: --micro-batch 32 (akumulacja liczy się sama). Kroki, lr i EMA przeskalowują się z batchem względem oryginału (256).
-# Wznawia się sam z <out>/latest.pt (co 1/50 runu); trwałe snap_<krok>.pt co 1/10 runu.
-# wandb włącza się sam, jeśli jest zalogowany (`wandb login`); projekt trenowanie_generatora_obrazkow, --no-wandb wyłącza.
-torchrun --nproc_per_node 8 train.py --data data/aurora --out runs/aurora --size 116m
-
-# WSM: zamiast wygaszać lr, uśredniamy checkpointy z końcówki treningu (schemat i okno wybierane na walidacji)
-python merge.py runs/aurora                                  # -> runs/aurora/merged.pt
-# eksport do formatu diffusers + siatka próbek
-python export.py runs/aurora/merged.pt exports/aurora
-python sample.py exports/aurora --out grid.png
-```
-
-## Duże modele: pipeline parallel (1F1B), `train_pp.py`
-
-Bloki DiT dzielone na `--pp` kart (Schedule1F1B z `torch.distributed.pipelining`). Stage 0 ma też text encoder, projekcję
-czasu i `patch_in`, ostatni stage `norm`, `patch_out` i stratę. Między kartami idą stany tokenów, modulacja czasu, tokeny
-tekstu i maska (oraz ich gradienty), strata REPA liczy się w stage'u z wybranym blokiem, a cele REPA (dekoder + DINOv2) liczą wszystkie karty po równo
-(micro-batch k na karcie k mod pp) i wysyłają do tego stage'u. Presety: `--size 1b / 1.5b / 2b`
-(szerokość 2048, 15/23/31 bloków) oraz `--size 1.6b / 2.4b` (szerokość 2560, head dim 128, 15/23 bloki; najlepsze TFLOPS na 3090 Ti wg `tests/bench_shapes.py`). Balans: zamrożony LM liczą wszystkie karty po równo (micro-batch k na karcie
-k mod pp, stany wysyłane do stage'u 0), a stage 0, który ma jeszcze trenowany refiner (~1 blok pracy, `--te-cost`),
-dostaje o 1 blok mniej; głębokość 8k−1 sprawia, że przy pp 8/4/2 wychodzi równo (2B na 8 kartach: [3, 4, 4, …]). Checkpointy są zbierane na rank 0 w tym samym formacie co z `train.py`, więc `export.py`,
-`merge.py` i `tests/check_export.py` działają bez zmian; stan optymalizatora per stage w `<out>/opt_stage<s>.pt`.
-
-```bash
-NCCL_P2P_LEVEL=SYS torchrun --nproc_per_node 8 train_pp.py --data data/aurora_full --fraction 1 --size 1.5b \
-  --pp 8 --batch 512 --microbatches 32 --out runs/1p5b
-# OOM: --act-checkpoint selective (trzyma wyniki matmuli i attention, przelicza tylko elementwise: ~2x mniej
-#      aktywacji, bez straty prędkości) albo --act-checkpoint (pełny: prawie zero aktywacji, ~25% wolniej);
-#      2 potoki po 4 karty: --pp 4 (+ --diloco H)
-```
-
-`tests/check_pp.py` (CPU, gloo, `torchrun --nproc_per_node 1/2/4`) sprawdza, że straty i gradienty (z REPA) są identyczne
-jak w niepodzielonym modelu.
-
-## NCCL na kartach GeForce
-
-Najpierw sprawdzić samą komunikację między kartami (kilka sekund, bez danych i modelu):
-
-```bash
-torchrun --nproc_per_node 8 tests/check_nccl.py
-```
-
-- **Sterownik z odblokowanym P2P** (np. łatka tinygrad na open-gpu-kernel-modules): NCCL domyślnie włącza P2P tylko dla kart
-  blisko siebie w topologii PCIe. Gdy ścieżka idzie przez CPU, trzeba to wymusić:
-  `NCCL_P2P_LEVEL=SYS torchrun ...`. Sprawdzenie: `python -c "import torch; print(torch.cuda.can_device_access_peer(0, 1))"`.
-- **Błąd `Error while attaching to shared memory segment /dev/shm/nccl-...`**: NCCL próbuje transportu przez `/dev/shm`.
-  Przy działającym P2P naprawia to `NCCL_P2P_LEVEL=SYS`. Bez P2P trzeba sprawdzić `df -h /dev/shm` (miejsce, uprawnienia
-  `drwxrwxrwt`), a w ostateczności `NCCL_SHM_DISABLE=1` (wolniejszy transport przez sockety).
-- `NCCL_DEBUG=INFO` pokazuje, którą drogę wybrało NCCL (`via P2P`, `via SHM`, `via NET`).
-- Te same zmienne środowiskowe daje się przed `torchrun ... train.py`.
-
-## Profil attention, GEMM i pętli treningu
-
-`tests/profile_dit.py` mierzy osobno SDPA (self/cross/refiner), GEMM forward/backward oraz pełny blok DiT.
-`--init` odczytuje rzeczywistą konfigurację checkpointu i wagi pierwszego bloku; nie ładuje Poziomki.
-Wejścia są syntetyczne, a pamięć jednego bloku **nie określa**, czy pełny model zmieści się z tym mikrobatchem.
-
-```bash
-# Najpierw na jednej wolnej karcie, bez równoległego treningu na tej samej GPU:
-CUDA_VISIBLE_DEVICES=0 python tests/profile_dit.py \
-  --init runs/poziomka_stage2/merged.pt --depth 12 \
-  --parts attention gemm block --mb 8 16 --text-widths 64 128 \
-  --out runs/profile_dit
-
-# Strojenie całego bloku; koszt kompilacji/autotuningu poza pomiarem:
-CUDA_VISIBLE_DEVICES=0 python tests/profile_dit.py \
-  --init runs/poziomka_stage2/merged.pt --parts block \
-  --mb 8 16 24 --text-widths 64 128 256 --checkpoints none selective \
-  --compile-modes default max-autotune-no-cudagraphs --out runs/profile_blocks
-```
-
-Wyniki są w `results.json`, konfiguracja sprzętu/modelu w `metadata.json`. Opcjonalne `--trace` zapisuje
-osobny profil po pomiarze każdej konfiguracji: timeline `.trace.json`, tabelę operatorów `.txt` i listę
-rzeczywistych kerneli oraz kształtów `.json`. Nieobsługiwane backendy są raportowane jako błędy danego przypadku,
-bez cichego powrotu do innego backendu. Attention jest sprawdzane względem SDPA math (wynik i gradienty).
-Wariant `varlen` korzysta z `torch.nn.attention.varlen` i obejmuje koszt pakowania K/V; nie zmienia treningu.
-`--parts block --block-backends auto cudnn` porównuje backendy cross-attention wewnątrz rzeczywistego
-bloku DiT, razem z projekcjami, normami, MLP i checkpointingiem.
-Licznik FLOPs używa faktycznej szerokości tekstu, lecz nie dolicza przeliczeń checkpointingu ani optymalizatora.
-
-Do istniejącej komendy `train_pp.py` można dopisać:
-
-```bash
---profile-dir runs/profile_train --profile-start 17 --profile-steps 4 --profile-ranks 0
-```
-
-Profiler działa również z `--bench`. Włącza się tylko na wskazanych **rankach treningowych**; dla `pp=2`
-warto wskazać `--profile-ranks 0 1`, aby zobaczyć obydwa etapy. Rejestruje m.in. `train/data_loader`,
-`train/lm_wait_collect`, `train/lm_request`, `train/forward_backward`, `train/gradient_sync_clip`,
-`train/optimizer` i `train/outer_sync_ema`. Suma czasów operatorów nie jest czasem ściennym: operatory
-są zagnieżdżone, a kernele mogą się nakładać. Krok z eksportem profilu oraz okno profilowania nie służą
-porównywaniu img/s. Ustaw początek po rozgrzaniu używanych szerokości tekstu.
-`opt avg` pokazuje średnią z całego okna logowania, również przy okresowym Muonie.
-
-`--masked-attention-backend cudnn` wymusza cuDNN dla cross-attention DiT i attention trainowalnego
-refinera tekstu. Domyślnie pozostaje `auto`; self-attention DiT i zamrożony LM zachowują swój backend.
-Wybór jest zapisany wewnątrz kompilowanego grafu. Wymaga obsługi danego kształtu przez cuDNN;
-nie ma cichego fallbacku. Porównuj rozgrzane przebiegi z tym samym microbatchem i checkpointingiem,
-ponieważ przyspieszenie pojedynczego attention nie przekłada się wprost na przyspieszenie całego kroku.
-
-Na 8 GPU legalne konfiguracje do porównania (batch 1008):
-
-| Układ | Opcje | Przykład podziału batcha |
-|---|---|---|
-| 7 replik, 1 serwer LM | `--pp 1 --lm-rank 1 --microbatches 9` | 7 × 9 × 16 |
-| 6 replik, 2 serwery LM | `--pp 1 --lm-rank 2 --microbatches 7` | 6 × 7 × 24 |
-| 8 replik z lokalnym LM | `--pp 1 --microbatches 9` (bez `--lm-rank`) | 8 × 9 × 14 |
-| 4 pipeline po 2 GPU, LM rozłożony domyślnie | `--pp 2 --microbatches 18` (bez `--lm-rank`) | 4 × 18 × 14 |
-| 3 pipeline po 2 GPU, 2 serwery LM | `--pp 2 --lm-rank 2 --microbatches 14` | 3 × 14 × 24 |
-
-To konfiguracje porównawcze, **nie zmierzone rekomendacje**. `--pp 2 --lm-rank 1` jest niepoprawne dla 8 GPU.
-Zmiana liczby replik zmienia lokalny batch DiLoCo oraz automatyczne skalowanie LR AdamW.
-Zachowaj wymagane przez maszynę `NCCL_P2P_LEVEL=SYS`. Lokalny LM zwiększa użycie VRAM i wykonuje pracę
-na tych samych GPU co denoiser; pp=2 dodaje komunikację i bąble pipeline.
-
-## Polski test porównawczy HomeIMG (22 prompty)
-
-Treść promptów: [`tests/homeimg22_pl.json`](tests/homeimg22_pl.json).
-Ustawienia: [`tests/homeimg22_settings.json`](tests/homeimg22_settings.json).
-Każdy prompt generujemy cztery razy z seedami **0, 1, 2, 3**: **1024 × 1024 px,
-CFG 3, time shift 6, 50 kroków**. To 88 obrazów na model, 264 dla trzech modeli.
-Nie używamy dodatkowego negative promptu; pozostałe ustawienia pochodzą z pipeline'u eksportu.
-
-Porównywane modele: `cpral/HomeIMG-1.2B-PL-EN-epoch49.2`,
-`cpral/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048` oraz
-`cpral/HomeIMG-1.2B-PL-EN-epoch49.2-DiffusionOPD3072`.
-
-Skrypt obsługuje samodzielne eksporty Diffusers (lokalne lub HF). Z katalogu repo na serwerze:
-
-```bash
-source /media/nvme_2tb/maked/image_gen/.venv/bin/activate
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python tests/homeimg22.py cpral/HomeIMG-1.2B-PL-EN-epoch49.2 --out-dir exports/test22_epoch49.2
-```
-
-Dla kolejnego modelu zmień model i katalog wynikowy. Każdy obraz powstaje osobno
-z generatorem CUDA ustawionym na podany seed, jednakowo dla wszystkich modeli.
-`--part K --parts N` dzieli obrazy między procesy/GPU bez zmiany seedów ani batcha.
-`--dry-run` wypisuje zadania bez ładowania modelu i generowania obrazów.
-Skrypt zapisuje PNG oraz manifest z promptami, seedami i parametrami;
-odmawia nadpisania istniejącego wyniku. Identyczne seedy nie gwarantują identycznych
-wyników między różnymi wersjami bibliotek lub sprzętem.
-
-Plansze do późniejszego blind testu powinny zawierać tylko obraz i pełny prompt
-bezpośrednio pod nim. Nazwy modeli, seedy i parametry pozostają poza planszami;
-manifestów nie udostępniamy oceniającym. Skrypt generuje obrazy źródłowe, nie plansze.
-
-## DanceOPD / DiffusionOPD w wielu rozdzielczościach
-
-W `train_pp.py` ustaw `--res 1024 --t-shift 6`,
-`--opd-resolutions 256 512 1024` i `--opd-res-shifts 1.5 3 6`.
-To osobna ścieżka od `--multi-res`, które miesza obrazy w jednym kroku zwykłego treningu FM.
-W OPD jedna rozdzielczość jest losowana na świeży batch trajektorii i pozostaje
-niezmienna przez wszystkie aktualizacje `--opd-reuse`. Batch i microbatch mają
-stałą liczbę obrazów, dobraną do największej rozdzielczości.
-
-Opcjonalne `--opd-token-batch` zwiększa batch niższych rozdzielczości przez
-akumulację dodatkowych microbatchy: mnożnik to `round((res_max / res)^2)`.
-Przy `--batch 50` i rozdzielczościach 256/512/1024 daje to 800/200/50 obrazów
-globalnie, czyli po 204800 tokenów obrazu na aktualizację (dla jednego stanu
-na trajektorię). Liczba obrazów w pojedynczym microbatchu i LR pozostają takie
-jak dla bazowego batcha 1024 px. Większa liczba tekstów zwiększa koszt LM i refinera,
-więc równa liczba tokenów obrazu nie oznacza identycznego czasu kroku.
-Checkpoint zapisuje zużytą pozycję strumienia danych osobno od liczby rolloutów;
-przy wznowieniu odrzucany lookahead nie powoduje pomijania captionów.
-
-`--opd-res-weights 1 1 1` (domyślne) oznacza równe prawdopodobieństwa batchów,
-**nie** bezpośrednio udziały tokenów: przy stałym batchu wynoszą one średnio
-1:4:16, a z `--opd-token-batch` w tym przykładzie 1:1:1.
-Można podać inne dodatnie wagi. Bez `--opd-res-shifts` przesunięcie wynosi
-`res / --t-shift-ref`, jeśli ref ustawiono, w przeciwnym razie
-`--t-shift * res / --res`.
-
-Wszystkie repliki wybierają tę samą rozdzielczość na podstawie seedu i kroku
-docelowego batcha. Działają zarówno lokalne rollouty, `--opd-prefetch`, jak
-i osobny `--opd-actor`. Cache przenosi rozdzielczość i time shift; po wznowieniu
-cache jest generowany na nowo, tak jak w dotychczasowym OPD.
-Teacher otrzymuje rozmiar latentów w każdym żądaniu; RoPE i micro-conditioning
-ucznia wynikają z rozmiaru wejścia. Log pokazuje bieżące `opd/resolution`
-i `opd/time_shift`, a TFLOPS uwzględniają rozdzielczości i liczbę stanów
-trenowanych w oknie logowania (bez kosztu rolloutu i teachera).
-Wymagane `--pp 1`; nie łączyć z `--multi-res`, `--crop-res` ani REPA.
-Pierwsze wystąpienie każdej rozdzielczości może wymagać kompilacji nowych grafów.
-
-Test CPU: `PYTHONPATH=. python tests/check_opd_resolution.py`.
-
-### Kolejka zamrożonych stanów tekstowych
-
-`--opd-text-ahead 4` przygotowuje cztery przyszłe batche na ucznia, niezależnie
-od aktora. Jeden wątek czyta captiony w kolejności harmonogramu rozdzielczości,
-a osobny GPU koduje zarówno Poziomkę (przed trenowanym refinerem), jak i Qwena
-teachera. Stany BF16 czekają w RAM; kolejka nie rośnie z długością treningu.
-Limit dotyczy czterech przyszłych batchów, oprócz aktualnie konsumowanego.
-Log podaje rozmiar stanów każdego batcha w MiB. Po wznowieniu kolejka jest
-odbudowywana od zapisanej, zużytej pozycji danych. Nie zapisujemy jej do checkpointu.
-
-Ten tryb wymaga `--opd-actor`, jednego serwera LM i dedykowanego teachera;
-nie łączy się z `--teacher-on-lm`. Przykładowe rozmieszczenie siedmiu ranków:
-`--skip-gpus 0 --opd-actor-gpus 2 7 --teacher-ranks 1 --teacher-gpu 4 --lm-rank 1 --lm-gpu 6`.
-Uczniowie zajmują wtedy GPU 1/3/5, aktorzy 2/7, teacher obrazu 4, oba encodery
-tekstu 6. Przy `--batch 30 --opd-token-batch` globalne batche to 480/120/30.
-Na GPU teachera nie jest ładowany Qwen. Rozmiary cache i wydajność należy
-sprawdzić benchmarkiem; gotowość tekstu nie oznacza gotowości rolloutów.
-Wersja wag aktora jest przypisywana dopiero przy wysłaniu zadania, więc dłuższa
-kolejka tekstu nie zwiększa dopuszczalnego wieku polityki.
-
-Test protokołu (CPU, cztery procesy Gloo):
-`PYTHONPATH=.:tests python tests/check_opd_text_queue.py`.
-
-## Struktura
-
-| plik | co robi |
+| Chcę… | Gdzie zacząć |
 |---|---|
-| `aurora/model.py` | text encoder + DiT (nazwy wag zgodne z HF), presety rozmiarów |
-| `aurora/muon.py` | Muon dzielony między ranki DDP (opcjonalny) |
-| `aurora/data.py` | dane przez mmap, deterministyczny i wznawialny strumień, hold-out |
-| `prepare_data.py` | `inspect` / `convert` / `tokenize` |
-| `train.py` | trening DDP: AdamW lub Muon, EMA, aux MLM, eval, checkpointy, wandb |
-| `merge.py` | WSM: ważone uśrednianie checkpointów z końcówki treningu |
-| `export.py` | checkpoint → katalog diffusers (działa z oryginalnym `pipeline.py`) |
-| `sample.py` | siatka 8 promptów z karty modelu |
-| `tests/` | zgodność z opublikowanymi wagami, poprawność Muona |
+| Przygotować dane, wytrenować mały model albo kontynuować trening z wag HF | [Przewodnik treningowy](docs/trening.md) |
+| Odtworzyć wielorozdzielczy DanceOPD lub zmienić strategię próbkowania stanów | [Destylacja i podział pracy między GPU](docs/destylacja.md) |
+| Sprawdzić komunikację kart i zmierzyć koszt kroku | [NCCL i profilowanie](docs/wydajnosc.md) |
+| Prześledzić implementację | [Architektura modelu](aurora/model.py) · [trening DDP](train.py) · [trening rozproszony i OPD](train_pp.py) |
 
-```bash
-python tests/check_model.py
-python tests/check_muon.py
-DIST_BACKEND=gloo torchrun --nproc_per_node 2 tests/check_muon.py   # 2 ranki na jednej karcie
-```
+## Jak porównuję checkpointy
 
-## Podziękowania i licencje
+Przygotowałem [22 polskie prompty](tests/homeimg22_pl.json). Każdy generuję z czterema ustalonymi seedami, co daje **88 obrazów na checkpoint**. W zestawie są m.in. trzy przedstawienia tej samej sceny wigilijnej: fotografia, akwarela i kadr CGI. Pozwala to ocenić, czy model potrafi zmienić medium, zachowując opis sceny. [Ustawienia i instrukcja odtworzenia plansz](docs/ewaluacja.md).
 
-- Bloki modelu w `aurora/model.py` pochodzą z `pipeline.py` modelu
-  [AuroraIMG2-50M-Preview](https://huggingface.co/AuroraAI-Research/AuroraIMG2-50M-Preview) (Apache-2.0).
-- Dekoder [FLUX.2 small decoder](https://huggingface.co/black-forest-labs/FLUX.2-small-decoder) © Black Forest Labs (Apache-2.0).
-- Muon: [Keller Jordan](https://kellerjordan.github.io/posts/muon/).
-- Dane mają własne licencje, patrz karty datasetów.
+W próbkach DanceOPD 2048 CFG 3 poprawiał czytelność kształtów względem CFG 1. Nadal widać problemy z liczeniem obiektów, czytelnym tekstem oraz anatomią postaci w tłumie. To obserwacje wizualne na konkretnych promptach. [Przykłady i ograniczenia wydania](model_cards/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048/README.md).
+
+## Autorstwo i komponenty
+
+HomeIMG rozwijam jako [adamo1139](https://github.com/adamo1139). Punktem wyjścia implementacji bloków DiT jest [AuroraIMG2-50M-Preview](https://huggingface.co/AuroraAI-Research/AuroraIMG2-50M-Preview) (Apache-2.0). Projekt korzysta również z [dekodera FLUX.2](https://huggingface.co/black-forest-labs/FLUX.2-small-decoder) (Apache-2.0), [Poziomki](https://huggingface.co/cpral/Poziomka-Baza-2026-09-05) i optymalizatora [Muon](https://kellerjordan.github.io/posts/muon/). Warunki korzystania z wag i danych znajdziesz w kartach poszczególnych wydań i zbiorów.
