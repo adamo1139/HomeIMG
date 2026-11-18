@@ -182,12 +182,12 @@ def get_args():
                    help="CPU queue of future batches encoded by both frozen text encoders on the LM GPU")
     p.add_argument("--klein", default="black-forest-labs/FLUX.2-klein-base-4B", help="--diffusion-opd / --dance-opd: klein base repo or dir")
     p.add_argument("--opd-cfg", type=float, default=4.0, help="--diffusion-opd / --dance-opd: the teacher's CFG scale (klein base: 4)")
-    p.add_argument("--klein-quant", default="", choices=["", "int8", "fp8"],
-                   help="--diffusion-opd / --dance-opd: teacher linear weights in 8 bits (aurora/klein.py QLinear; ~8 GB instead of ~16, bf16 "
-                        "matmuls). int8 (one scale per 128 inputs) is ~3x more accurate than fp8")
+    p.add_argument("--klein-quant", default="", choices=["", "int8", "fp8", "w8a8"],
+                   help="--diffusion-opd / --dance-opd: int8/fp8 store weights in 8 bits with bf16 matmuls; w8a8 uses dynamic INT8 matmuls in the Klein transformer")
     p.add_argument("--teacher-on-lm", action="store_true",
                    help="--diffusion-opd / --dance-opd: the --lm-rank server(s) also host klein (needs --klein-quant) and take a share of the "
                         "states like the --teacher-ranks; that GPU is otherwise ~99%% idle during OPD")
+    p.add_argument("--opd-sort-rollouts", action="store_true", help="sort local trajectories by last queried Euler step before partitioning")
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--diffusion-opd / --dance-opd: Euler steps of the student's trajectories")
     p.add_argument("--opd-actor", action="store_true",
                    help="dedicated rollout GPU(s); fresh snapshot at cycle start, next batch generated during replay")
@@ -835,6 +835,18 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
                          (encoded_text["q_ids"], encoded_text["q_mask"]))
     states = stage.lm_states
     lm_full = torch.cat(states) if states is not None else None  # (B, L, H)
+    if getattr(args, "opd_sort_rollouts", False):
+        # Keep every caption, noise sample, target and replay row in the same order.
+        order = picks.amax(dim=1).argsort(stable=True)
+        gpu_order = order.to(eps.device)
+        picks = picks[order]
+        eps, ids = eps[gpu_order], ids[gpu_order]
+        ids_cpu = ids_cpu[order] if ids_cpu is not None else None
+        lm_full = lm_full[gpu_order] if lm_full is not None else None
+        q_ids, q_mask = q_ids[order], q_mask[order]
+        if encoded_text is not None:
+            teacher_text = encoded_text["teacher_text"]
+            encoded_text = dict(encoded_text, teacher_text=teacher_text[order.to(teacher_text.device)])
     assert parts > 0, "--opd-parts must be positive"
     per = -(-B // parts)
     assert (per * m) % mb == 0 or parts == 1, \

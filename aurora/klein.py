@@ -67,11 +67,41 @@ class QLinear(torch.nn.Module):
         return torch.nn.functional.linear(x, w, self.bias)
 
 
+class W8A8Linear(torch.nn.Module):
+    """Frozen per-output-channel weights, dynamic per-token activation scales, INT32 accumulation."""
+
+    def __init__(self, lin):
+        super().__init__()
+        w = lin.weight.detach().float()
+        scale = w.abs().amax(1).clamp_min(1e-12) / 127
+        self.register_buffer("scale", scale)
+        self.register_buffer("weight_t", (w / scale[:, None]).round().clamp(-127, 127).to(torch.int8).contiguous().T)
+        self.bias = lin.bias
+
+    def forward(self, x):
+        rows = x.reshape(-1, x.shape[-1]).float()
+        scale = rows.abs().amax(1, keepdim=True).clamp_min(1e-12) / 127
+        q = (rows / scale).round().clamp(-127, 127).to(torch.int8)
+        # cuBLAS INT8 requires aligned matrix sizes, including short conditioning batches.
+        pad = max(24, ((q.shape[0] + 7) // 8) * 8) - q.shape[0]
+        if pad:
+            q = torch.nn.functional.pad(q, (0, 0, 0, pad))
+        acc = torch._int_mm(q, self.weight_t)[:rows.shape[0]]
+        out = acc.float() * scale * self.scale
+        if self.bias is not None:
+            out = out + self.bias
+        return out.to(x.dtype).reshape(*x.shape[:-1], -1)
+
+
 def quantize(module: torch.nn.Module, kind: str) -> torch.nn.Module:
-    """Every nn.Linear in `module` -> QLinear(kind)."""
+    """Replace eligible linear layers with frozen quantized projections."""
     for name, child in list(module.named_children()):
         if isinstance(child, torch.nn.Linear):
-            setattr(module, name, QLinear(child, kind))
+            if kind == "w8a8":
+                if child.in_features % 8 == 0 and child.out_features % 8 == 0:
+                    setattr(module, name, W8A8Linear(child))
+            else:
+                setattr(module, name, QLinear(child, kind))
         else:
             quantize(child, kind)
     return module
@@ -104,7 +134,7 @@ class KleinTeacher:
         for mod in (self.transformer, self.te):
             if mod is not None:
                 if quant:
-                    quantize(mod, quant)
+                    quantize(mod, "int8" if mod is self.te and quant == "w8a8" else quant)
                 mod.to(device).eval().requires_grad_(False)
         if compile and self.transformer is not None:
             self.transformer = torch.compile(self.transformer)
