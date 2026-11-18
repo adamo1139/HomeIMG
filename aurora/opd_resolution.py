@@ -3,6 +3,34 @@ import math
 import random
 
 
+def balanced_dance_picks(seed, step, replica, replicas, batch, states, steps, beta, mb, parts):
+    """Redistribute the original global draw before pairing times with local prompts."""
+    import numpy as np
+
+    draws = [np.random.default_rng([seed, r, step, 52]).beta(*beta, size=(batch, states))
+             for r in range(replicas)]
+    picks = np.minimum((np.concatenate(draws) * steps).astype(np.int64), steps - 1)
+    depth = picks.max(axis=1)
+    stripes = np.argsort(depth, kind="stable").reshape(batch, replicas)
+    per_part = math.ceil(batch / parts)
+    cost = np.zeros(replicas, dtype=np.int64)
+    local = np.empty((batch, states), dtype=np.int64)
+    rng = np.random.default_rng([seed, step, 53])
+    tie_order = rng.permutation(replicas)
+    for i, stripe in enumerate(stripes):
+        # Local sorting makes the final row of each rollout microbatch its forward count.
+        offset = i % per_part + 1
+        if offset % mb == 0 or offset == per_part or i + 1 == batch:
+            ranks = tie_order[np.argsort(cost[tie_order], kind="stable")]
+            stripe = stripe[::-1]
+            cost[ranks] += depth[stripe]
+        else:
+            ranks = tie_order
+        local[i] = picks[stripe[np.argmax(ranks == replica)]]
+    # Randomize time-to-prompt assignment before the usual joint local sort.
+    return local[np.random.default_rng([seed, replica, step, 54]).permutation(batch)]
+
+
 def validate(args):
     resolutions = args.opd_resolutions
     microbatches = getattr(args, "opd_res_mb", ())

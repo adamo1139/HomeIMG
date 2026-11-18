@@ -188,6 +188,7 @@ def get_args():
     p.add_argument("--teacher-on-lm", action="store_true",
                    help="--diffusion-opd / --dance-opd: the --lm-rank server(s) also host klein (needs --klein-quant) and take a share of the "
                         "states like the --teacher-ranks; that GPU is otherwise ~99%% idle during OPD")
+    p.add_argument("--opd-balance-rollouts", action="store_true", help="balance DanceOPD rollout forwards across learners; implies local sorting")
     p.add_argument("--opd-sort-rollouts", action="store_true", help="sort local trajectories by last queried Euler step before partitioning")
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--diffusion-opd / --dance-opd: Euler steps of the student's trajectories")
     p.add_argument("--opd-actor", action="store_true",
@@ -827,7 +828,11 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     phase = timings.measure if timings is not None else lambda name: nullcontext()
     B, m, K = eps.shape[0], args.opd_states, args.opd_rollout_steps
     g = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + step + 7)
-    if args.dance_opd:  # DanceOPD: Beta(A, B) (--dance-beta, the paper's 5 2) over the normalised trajectory
+    if getattr(args, "opd_balance_rollouts", False):
+        from aurora.opd_resolution import balanced_dance_picks
+        picks = torch.from_numpy(balanced_dance_picks(args.seed, step, replica, args.opd_replicas, B, m, K,
+                                                      args.dance_beta, mb, parts))
+    elif args.dance_opd:  # DanceOPD: Beta(A, B) (--dance-beta, the paper's 5 2) over the normalised trajectory
         u = np.random.default_rng([args.seed, replica, step, 52]).beta(*args.dance_beta, size=(B, m))
         picks = torch.from_numpy((u * K).astype(np.int64)).clamp(max=K - 1)
     else:
@@ -1115,6 +1120,9 @@ def main():
     assert args.opd_actor or args.opd_actor_gpu == -1, "--opd-actor-gpu needs --opd-actor"
     assert not args.opd_actor_gpus or (args.opd_actor and args.opd_actor_gpu == -1), "Use --opd-actor-gpus with --opd-actor, without --opd-actor-gpu"
     assert len(set(args.opd_actor_gpus)) == len(args.opd_actor_gpus), "Actor GPUs must be distinct"
+    if args.opd_balance_rollouts:
+        assert args.dance_opd and args.pp == 1 and args.opd_reuse == 1, "--opd-balance-rollouts needs fresh local DanceOPD"
+        args.opd_sort_rollouts = True
     if args.opd_learner_profile:
         assert args.opd and args.opd_reuse == 1 and not args.opd_actor, \
             "--opd-learner-profile measures fresh local rollouts (OPD, reuse 1, no dedicated actor)"
@@ -1145,6 +1153,7 @@ def main():
     teacher_clients = actor_ranks if args.opd_actor else list(range(world))
     assert world % pp == 0, f"{world} training ranks are not a multiple of --pp {pp}"
     replicas = world // pp
+    args.opd_replicas = replicas
     replica, s = divmod(rank, pp) if rank < world else (-1, 0)
     first, last = s == 0, s == pp - 1
     n_dev = max(1, torch.cuda.device_count())
