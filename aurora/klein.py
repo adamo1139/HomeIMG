@@ -254,12 +254,11 @@ class TeacherClient:
         parts = []
         bounds = torch.linspace(0, len(ids), len(self.servers) + 1).round().long().tolist()
         cap_cpu = cap.cpu()
-        assignments = list(zip(self.servers, bounds[:-1], bounds[1:]))
-        offset = (dist.get_rank() + self.request_index) % len(assignments)
+        offset = (dist.get_rank() + self.request_index) % len(self.servers)
         self.request_index += 1
-        # Rotate dispatch only; collect restores the original trajectory order.
-        assignments = assignments[offset:] + assignments[:offset]
-        for server, c0, c1 in assignments:
+        # Rotate servers against fixed ranges so empty ranges do not always skip the same GPU.
+        servers = self.servers[offset:] + self.servers[:offset]
+        for server, c0, c1 in zip(servers, bounds[:-1], bounds[1:]):
             if c1 == c0:
                 continue
             s0, s1 = int(torch.searchsorted(cap_cpu, c0)), int(torch.searchsorted(cap_cpu, c1))
