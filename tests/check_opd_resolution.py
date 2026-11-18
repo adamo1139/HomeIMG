@@ -19,6 +19,7 @@ ns = extract(source, {"opd_step", "opd_rollout", "opd_replay", "local_train_step
                       "opd_collect_prepared", "rollout_actor_server"})
 args = SimpleNamespace(opd=True, pp=1, multi_res=[], crop_res=[], repa_weight=0,
                        opd_resolutions=[256, 512, 1024], opd_res_weights=[], opd_res_shifts=[1.5, 3, 6],
+                       opd_token_batch=False,
                        res=1024, t_shift=6, t_shift_ref=0, seed=87462,
                        opd_reuse=12, opd_states=1, opd_rollout_steps=4, dance_opd=True, dance_beta=(1, 1),
                        text_bucket=False, opd_parts=1, opd_state_weighting=False, cfg_drop=0,

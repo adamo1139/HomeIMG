@@ -219,9 +219,20 @@ W OPD jedna rozdzielczość jest losowana na świeży batch trajektorii i pozost
 niezmienna przez wszystkie aktualizacje `--opd-reuse`. Batch i microbatch mają
 stałą liczbę obrazów, dobraną do największej rozdzielczości.
 
+Opcjonalne `--opd-token-batch` zwiększa batch niższych rozdzielczości przez
+akumulację dodatkowych microbatchy: mnożnik to `round((res_max / res)^2)`.
+Przy `--batch 50` i rozdzielczościach 256/512/1024 daje to 800/200/50 obrazów
+globalnie, czyli po 204800 tokenów obrazu na aktualizację (dla jednego stanu
+na trajektorię). Liczba obrazów w pojedynczym microbatchu i LR pozostają takie
+jak dla bazowego batcha 1024 px. Większa liczba tekstów zwiększa koszt LM i refinera,
+więc równa liczba tokenów obrazu nie oznacza identycznego czasu kroku.
+Checkpoint zapisuje zużytą pozycję strumienia danych osobno od liczby rolloutów;
+przy wznowieniu odrzucany lookahead nie powoduje pomijania captionów.
+
 `--opd-res-weights 1 1 1` (domyślne) oznacza równe prawdopodobieństwa batchów,
-**nie** równe udziały tokenów: przy stałym batchu udziały tokenów wynoszą średnio
-1:4:16. Można podać inne dodatnie wagi. Bez `--opd-res-shifts` przesunięcie wynosi
+**nie** bezpośrednio udziały tokenów: przy stałym batchu wynoszą one średnio
+1:4:16, a z `--opd-token-batch` w tym przykładzie 1:1:1.
+Można podać inne dodatnie wagi. Bez `--opd-res-shifts` przesunięcie wynosi
 `res / --t-shift-ref`, jeśli ref ustawiono, w przeciwnym razie
 `--t-shift * res / --res`.
 

@@ -200,6 +200,8 @@ def get_args():
                    help="one resolution per fresh rollout batch, unchanged throughout replay; e.g. 256 512 1024")
     p.add_argument("--opd-res-weights", type=float, nargs="+", default=[],
                    help="relative probabilities of fresh batches, NOT token proportions; default: equal")
+    p.add_argument("--opd-token-batch", action="store_true",
+                   help="scale images per rollout batch by round((res_max/res)^2); --batch is the largest-resolution batch")
     p.add_argument("--opd-res-shifts", type=float, nargs="+", default=[],
                    help="time shifts per OPD resolution; e.g. 1.5 3 6; default: res / t-shift-ref or t-shift * res / res_max")
     p.add_argument("--keep-ckpt-steps", type=int, nargs="*", default=[],
@@ -1011,7 +1013,8 @@ def main():
     args = resolve_defaults(get_args())
     assert not (args.diffusion_opd and args.dance_opd), "--diffusion-opd or --dance-opd, not both"
     args.opd = args.diffusion_opd or args.dance_opd  # the on-policy distillation path (opd_step) for either
-    from aurora.opd_resolution import validate as validate_opd_resolution, batch_resolution, time_shift as opd_time_shift
+    from aurora.opd_resolution import (validate as validate_opd_resolution, batch_resolution,
+                                       time_shift as opd_time_shift, batch_multiplier, gather_caption_batches)
     validate_opd_resolution(args)
     if args.opd_resolutions:
         torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
@@ -1316,6 +1319,7 @@ def main():
     opt_path = os.path.join(args.out, f"opt_stage{s}.pt")
     step, outer_state = 0, None
     opd_batches = 0  # consumed fresh batches; replay cache is intentionally not checkpointed
+    opd_data_batches = 0  # consumed base-size loader batches, excludes untrained lookahead
     if os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location="cpu", weights_only=True, mmap=True)
         ck_cfg = DenoiserConfig(**ck["den_config"])
@@ -1361,6 +1365,7 @@ def main():
                   f"optimizer state starts fresh", flush=True)
         step = ck["step"]
         opd_batches = ck.get("opd_batches", step)
+        opd_data_batches = ck.get("opd_data_batches", opd_batches)
         log(f"resumed from {ckpt_path} at step {step}")
         del ck, os_ck
 
@@ -1465,7 +1470,7 @@ def main():
                 f"{', '.join(f'{r} px' for r in args.crop_res)} latents ({', '.join(k for k, _ in crops)})")
         if alt_suffix:
             log(f"captions: {100 * args.pl_prob:.0f}% Polish ({alt_suffix}), the rest English")
-        stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=opd_batches if args.opd else step,
+        stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=opd_data_batches if args.opd else step,
                              sort_pad=LM_PAD if hf_lm else None, rows=args.opd,
                              res_groups=[(r, n * k) for r, n, k in mr_groups] or None)
         loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
@@ -1474,8 +1479,12 @@ def main():
                                                   persistent_workers=args.workers > 0))
     n_train = len(store) if store is not None else sum(
         len(np.load(os.path.join(args.data, f"{n}.off.npy"), mmap_mode="r")) - 1 for n in train_names)
-    log(f"train: {len(train_names)} shards / {n_train:,} images; {args.steps} steps x {args.batch} = "
-        f"{args.steps * args.batch / n_train:.1f} epochs")
+    if args.opd_token_batch:
+        log(f"train: {len(train_names)} shards / {n_train:,} images; {args.steps} updates, "
+            f"base batch {args.batch} at {args.res}px; variable fresh batches, reuse {args.opd_reuse}")
+    else:
+        log(f"train: {len(train_names)} shards / {n_train:,} images; {args.steps} steps x {args.batch} = "
+            f"{args.steps * args.batch / n_train:.1f} epochs")
     def lm_split_forward_(chunks):
         return lm_split_forward(lm_enc.lm, chunks, s, pp, replica * pp, device, lm_hidden)
 
@@ -1610,7 +1619,8 @@ def main():
         if master:
             te_sd = {n: raw[("te", n)] for n in te_names}
             den_sd = {n: raw[("den", n)] for n, _ in den.named_parameters()}
-            meta = dict(step=step, opd_batches=opd_batches, den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=te_sd, den=den_sd)
+            meta = dict(step=step, opd_batches=opd_batches, opd_data_batches=opd_data_batches,
+                        den_config=asdict(den_cfg), te_config=asdict(te_cfg), te=te_sd, den=den_sd)
             if merge_only:
                 d = os.path.join(args.out, "merge")
                 os.makedirs(d, exist_ok=True)
@@ -1690,7 +1700,7 @@ def main():
         + (f"res / {args.t_shift_ref:g}" if args.t_shift_ref else f"{args.t_shift:.2f}"))
     if args.opd_resolutions:
         log("OPD resolution per fresh batch (constant through replay): " + ", ".join(
-            f"{r}px TS {opd_time_shift(args, r):g}, batch weight {w:g}" for r, w in zip(
+            f"{r}px TS {opd_time_shift(args, r):g}, batch {args.batch * batch_multiplier(args, r)}, weight {w:g}" for r, w in zip(
                 args.opd_resolutions, args.opd_res_weights or [1] * len(args.opd_resolutions))))
     if mr_groups:
         log("multi-res per replica and step: " + ", ".join(
@@ -1794,6 +1804,12 @@ def main():
                     if hf_lm and null_row is not None else None)
         return groups, ids, None, None, cond, cond_cpu, rows, mcond
 
+    def load_rollout_batch(at):
+        if not args.opd_token_batch:
+            return next(loader)
+        factor = batch_multiplier(args, batch_resolution(args, at))
+        return gather_caption_batches(loader, factor, has_cond)
+
     def next_batch(at):
         """The pipeline's batch of step `at` (latents, t, noise, captions with CFG drop); None on stages without data."""
         if not needs_data:
@@ -1806,13 +1822,14 @@ def main():
             eps = torch.randn(shape, device=device, generator=g)
             return torch.empty(shape, device=device), None, t, eps, None, None, None, None
         with profile.phase("data_loader"):
-            got = next(loader)  # with a transformers LM: sorted by caption length in the loader (TrainStream)
+            got = load_rollout_batch(at) if args.opd_token_batch else next(loader)
             mcond = got[-1].to(device, non_blocking=True) if has_cond else None
             got = got[:-1] if has_cond else got
             lat, ids, rows = got if args.opd else (*got, None)
         ids_cpu = ids
+        batch_n = len(ids)
         side = batch_resolution(args, at) // 16 if args.opd_resolutions else den_cfg.latent_size
-        shape = (per_pipe, den_cfg.latent_channels, side, side)
+        shape = (batch_n, den_cfg.latent_channels, side, side)
         if mr_groups:
             return multi_res_batch(at, lat, ids, ids_cpu, rows, mcond)
         with profile.phase("vae_encode"):
@@ -1831,11 +1848,11 @@ def main():
                 x0 = lat.to(device, non_blocking=True).float()
         ids = ids.to(device, non_blocking=True)
         g = torch.Generator(device=device).manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
-        t = shift_t(torch.sigmoid(torch.randn(per_pipe, device=device, generator=g)), args.res)
+        t = shift_t(torch.sigmoid(torch.randn(batch_n, device=device, generator=g)), args.res)
         eps = torch.randn(shape if isinstance(x0, dict) else x0.shape, device=device, generator=g)
         # caption dropout drawn on the CPU (same seed), so the CPU copy of the captions needs no GPU -> CPU sync
         g_cpu = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + at)
-        drop_cpu = torch.rand(per_pipe, generator=g_cpu) < args.cfg_drop
+        drop_cpu = torch.rand(batch_n, generator=g_cpu) < args.cfg_drop
         drop = drop_cpu.to(device, non_blocking=True)
         cond = torch.where(drop[:, None], null_row, ids) if null_row is not None else None
         cond_cpu = (torch.where(drop_cpu[:, None], null_cpu, ids_cpu)
@@ -1858,7 +1875,7 @@ def main():
 
     def request_actor(at):
         # Only captions are sent to the actor. Do not run VAE/LM in the learner training loop.
-        got = next(loader)
+        got = load_rollout_batch(at)
         if has_cond:
             got = got[:-1]
         _, token_ids, caption_rows = got
@@ -1880,6 +1897,7 @@ def main():
         actor_snapshot_seconds += time.perf_counter() - snapshot_start
     opd_acc = torch.zeros(4, device=device)  # fresh loss/count, replay loss/count
     flops_window = 0.0
+    images_window = 0
     pending = None  # --lm-rank: the next step's batch and its LM request, sent while the current step trains
     # all training ranks enter step 1 together: stages without data / validation work would otherwise start the
     # pipeline's first p2p (NCCL communicator setup) long before stage 0 is ready
@@ -1942,7 +1960,7 @@ def main():
                     gr["lm"] = [h[j * gr["mb"]:(j + 1) * gr["mb"]] for j in range(gr["n"])]
                 del lm_full
             elif lm_client is not None:
-                stage_mod.lm_states = [lm_full[k * mb:(k + 1) * mb] for k in range(M)]
+                stage_mod.lm_states = list(lm_full.split(mb))
                 del lm_full
             if lm_offload and args.lm_split:  # whole step's captions through the stages' LM slices, ~32 per chunk
                 per = max(1, 32 // mb)
@@ -1952,11 +1970,12 @@ def main():
                     stage_mod.lm_states = [h[j * mb:(j + 1) * mb] for g, h in zip(groups, got) for j in range(len(g))]
             elif lm_offload:
                 mine = {}
-                ks = [k for k in range(M) if k % pp == s]
+                step_M = len(cond_ids) // mb if args.opd else M
+                ks = [k for k in range(step_M) if k % pp == s]
                 if hf_lm and pp == 1:  # the whole batch in one packed LM call (hf_states_packed cuts it to ~8k tokens)
                     with profile.phase("lm_local"):
                         h = lm_fn(cond_ids)
-                    mine = {k: h[k * mb:(k + 1) * mb] for k in range(M)}
+                    mine = {k: h[k * mb:(k + 1) * mb] for k in range(step_M)}
                 elif hf_lm:  # ~32 captions per LM call (the MoE's sweet spot; micro-batches of similar length go together)
                     per = max(1, 32 // mb)
                     for i in range(0, len(ks), per):
@@ -1968,7 +1987,7 @@ def main():
                     for k in ks:
                         with amp:
                             mine[k] = lm_fn(cond_ids[k * mb:(k + 1) * mb])
-                stage_mod.lm_states = gather_to_stage(mine, M, s, pp, 0, replica * pp)
+                stage_mod.lm_states = gather_to_stage(mine, step_M, s, pp, 0, replica * pp)
             if args.opd:
                 opd_batches += 1
         if actor_client is not None:
@@ -1989,7 +2008,7 @@ def main():
                 nb = next_batch(future_step)
                 request = lm_client.request(nb[5])
                 future_lm = lm_client.collect(request)
-                stage_mod.lm_states = [future_lm[k * mb:(k + 1) * mb] for k in range(M)]
+                stage_mod.lm_states = list(future_lm.split(mb))
                 opd_next = {}
                 try:
                     with amp:
@@ -2000,6 +2019,9 @@ def main():
                     stage_mod.lm_states = saved_states
                 del nb, request, future_lm, saved_states
         active_opd_res = (opd_cache["resolution"] if prepared or replay else eps.shape[-1] * 16) if args.opd else args.res
+        active_batch = args.batch * batch_multiplier(args, active_opd_res)
+        if args.opd and not replay:
+            opd_data_batches += batch_multiplier(args, active_opd_res)
         stage_mod.repa_targets = None
         if step < repa_steps and step % args.repa_every == 0:
             n_repa = max(1, round(args.repa_frac * mb))
@@ -2119,7 +2141,8 @@ def main():
                 dump_snapshot("OOM")
                 raise
         step += 1
-        flops_window += opd_flops.get(active_opd_res, flops_sample)
+        flops_window += opd_flops.get(active_opd_res, flops_sample) * active_batch
+        images_window += active_batch
         if args.opd:
             opd_pass += 1
         if args.mem_debug and step <= 3:
@@ -2160,9 +2183,11 @@ def main():
                         stats[f"opd/loss_{label}"] = (opd_acc[j] / opd_acc[j + 1]).item()
                 opd_acc.zero_()
                 stats.update({"opd/reuse_pass": opd_pass, "opd/fresh_batches": opd_batches,
-                              "opd/fresh_trajectories": opd_batches * args.batch})
+                              "opd/fresh_trajectories": opd_data_batches * args.batch})
                 stats.update({"opd/resolution": active_opd_res,
-                              "opd/time_shift": opd_time_shift(args, active_opd_res)})
+                              "opd/time_shift": opd_time_shift(args, active_opd_res),
+                              "opd/batch_images": active_batch,
+                              "opd/batch_tokens": active_batch * (active_opd_res // 16) ** 2})
             if actor_client is not None:
                 stats["opd/actor_step"] = opd_cache["actor_step"]
                 stats["opd/actor_age"] = step - 1 - opd_cache["actor_step"]
@@ -2202,14 +2227,14 @@ def main():
             # printing, W&B and any following eval/checkpoint are included in the next window.
             stamp = time.time()
             dt = stamp - t0
-            stats.update(steps_per_s=n / dt, imgs_per_s=n * args.batch / dt,
-                         tflops_per_gpu=flops_window * args.batch / dt / world / 1e12)
+            stats.update(steps_per_s=n / dt, imgs_per_s=images_window / dt,
+                         tflops_per_gpu=flops_window / dt / world / 1e12)
             if peak:
                 stats["mfu"] = stats["tflops_per_gpu"] / peak
                 mfu = f" MFU {stats['mfu']:.0%}"
             opd_s = f" | OPD {'replay' if replay else 'prefetched' if prepared else 'fresh'} {opd_pass}/{args.opd_reuse}" if args.opd else ""
             if args.opd_resolutions:
-                opd_s += f" {active_opd_res}px TS {opd_time_shift(args, active_opd_res):g}"
+                opd_s += f" {active_opd_res}px TS {opd_time_shift(args, active_opd_res):g} batch {active_batch}"
             if actor_client is not None:
                 opd_s += (f" | actor v{opd_cache['actor_step']} age {step - 1 - opd_cache['actor_step']}"
                           f" wait {actor_wait_seconds:.2f}s sync {actor_snapshot_seconds:.2f}s")
@@ -2221,6 +2246,7 @@ def main():
                 wb.log(stats, step=step)
             acc.zero_()
             flops_window = 0.0
+            images_window = 0
             t0, t_last = stamp, step
 
         profile.end_step(step)

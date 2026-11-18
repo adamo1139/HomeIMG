@@ -6,6 +6,8 @@ import random
 def validate(args):
     resolutions = args.opd_resolutions
     if not resolutions:
+        if getattr(args, "opd_token_batch", False):
+            raise ValueError("--opd-token-batch needs --opd-resolutions")
         if args.opd_res_weights or args.opd_res_shifts:
             raise ValueError("--opd-res-weights / --opd-res-shifts need --opd-resolutions")
         return
@@ -45,3 +47,23 @@ def time_shift(args, resolution):
         return args.t_shift * resolution / args.res
     # Preserve historical single-resolution OPD behaviour.
     return args.t_shift
+
+
+def batch_multiplier(args, resolution):
+    """Whole base batches keep replica / microbatch / OPD-part divisibility intact."""
+    return max(1, round((args.res / resolution) ** 2)) if getattr(args, "opd_token_batch", False) else 1
+
+
+def gather_caption_batches(loader, count, has_cond=False):
+    """Discard unused images immediately; combine only captions and their source rows."""
+    import torch
+    ids, rows = [], []
+    for _ in range(count):
+        got = next(loader)
+        ids.append(got[1])
+        rows.append(got[2])
+        del got
+    ids, rows = torch.cat(ids), torch.cat(rows)
+    result = (torch.empty(len(ids), 0), ids, rows)
+    # next_batch removes loader conditions; OPD uses whole-image conditioning.
+    return result + (torch.empty(len(ids), 8),) if has_cond else result
