@@ -142,29 +142,33 @@ class ShardStore:
     def __len__(self):
         return int(self.starts[-1])
 
-    def _open(self):  # lazily, so every DataLoader worker gets its own handles
-        if self._lat is None:
+    def _open(self, captions_only=False):  # lazily, per DataLoader worker
+        if self._lat is None and not captions_only:
             if self.img_res:
                 self._lat = [(np.memmap(os.path.join(self.lat_root, f"{n}.img.bin"), dtype=np.uint8, mode="r"),
                               np.load(os.path.join(self.lat_root, f"{n}.img.off.npy"))) for n in self.names]
             else:
                 self._lat = [np.load(os.path.join(self.lat_root, f"{n}.{self.lat_kind}.npy"), mmap_mode="r")
                              for n in self.names]
+            self._crop = [[np.load(os.path.join(r or self.root, f"{n}.{k}.npy"), mmap_mode="r") for n in self.names]
+                          for k, r in self.crops]
+        if self._tok is None:
             self._tok = [np.load(self._p(n, self.tok), mmap_mode="r") for n in self.names]
             if self.alt:
                 self._alt = [np.load(self._p(n, self.alt), mmap_mode="r") for n in self.names]
-            self._crop = [[np.load(os.path.join(r or self.root, f"{n}.{k}.npy"), mmap_mode="r") for n in self.names]
-                          for k, r in self.crops]
 
-    def fetch(self, indices: np.ndarray, rng: np.random.Generator | None, rows: bool = False, res: int = 0):
+    def fetch(self, indices: np.ndarray, rng: np.random.Generator | None, rows: bool = False, res: int = 0,
+              captions_only: bool = False):
         """Latents + one caption per image (random if rng is given, else the first one). rows: also (B, 2) [shard,
         caption row] of the caption picked (-1 for images without one); the row is the same in the translated files,
         so it also finds the English original of a Polish caption (CaptionText). res: images decoded at this size
         instead of img_res (mixed-resolution batches)."""
-        self._open()
+        assert not captions_only or not self.crops, "Caption-only loading cannot reproduce crop RNG"
+        self._open(captions_only)
         picked = np.full((len(indices), 2), -1, dtype=np.int64)
         res = res or self.img_res
-        lat = (np.empty((len(indices), 3, res, res), dtype=np.uint8) if res
+        lat = (np.empty((len(indices), 0), dtype=np.float16) if captions_only else
+               np.empty((len(indices), 3, res, res), dtype=np.uint8) if res
                else np.empty((len(indices), *self._lat[0].shape[1:]), dtype=np.float16))
         ids = np.empty((len(indices), self._tok[0].shape[1]), dtype=np.int64)
         n = lat.shape[-1]  # target grid side
@@ -173,7 +177,9 @@ class ShardStore:
         shard = np.searchsorted(self.starts, indices, side="right") - 1
         for j, (s, gi) in enumerate(zip(shard, indices)):
             i = gi - self.starts[s]
-            if self._crop and rng is not None and rng.random() < self.crop_prob:
+            if captions_only:
+                pass  # OPD actors need only caption IDs and original English text.
+            elif self._crop and rng is not None and rng.random() < self.crop_prob:
                 src = self._crop[rng.integers(len(self._crop))][s]
                 side = src.shape[-1]
                 r, c = rng.integers(0, side - n + 1, size=2)
@@ -271,7 +277,7 @@ class TrainStream(IterableDataset):
     """
 
     def __init__(self, store: ShardStore, micro_batch: int, rank: int, world: int, seed: int, start_micro: int = 0,
-                 sort_pad=None, rows: bool = False, res_groups=None):
+                 sort_pad=None, rows: bool = False, res_groups=None, captions_only=False):
         """sort_pad: caption pad id -> rows ordered by caption length (stable), here in the worker, so the loader's
         pinned batch reaches the GPU without another copy (train_pp.py's similar-length micro-batches). rows: also
         yield ShardStore.fetch's (B, 2) caption rows. res_groups: [(res, n images)] summing to micro_batch: the batch's
@@ -281,6 +287,8 @@ class TrainStream(IterableDataset):
         self.store, self.mb, self.rank, self.world = store, micro_batch, rank, world
         self.seed, self.start, self.sort_pad, self.rows = seed, start_micro, sort_pad, rows
         self.res_groups = res_groups
+        self.captions_only = captions_only
+        assert not captions_only or not res_groups
         assert not res_groups or sum(n for _, n in res_groups) == micro_batch
         self.per_epoch = len(store) // (micro_batch * world)  # micro-batches per rank per epoch
 
@@ -300,7 +308,8 @@ class TrainStream(IterableDataset):
                 yield self._mixed(idx, m)
                 m += nw
                 continue
-            got = self.store.fetch(idx, np.random.default_rng([self.seed, m, self.rank, 1]), rows=True)
+            got = self.store.fetch(idx, np.random.default_rng([self.seed, m, self.rank, 1]), rows=True,
+                                   **({"captions_only": True} if self.captions_only else {}))
             lat, ids, picked, *cond = (torch.from_numpy(x) for x in got)
             if self.sort_pad is not None:
                 order = ids.ne(self.sort_pad).sum(1).argsort(stable=True)

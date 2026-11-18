@@ -74,13 +74,17 @@ print("PASS: 800/200/50 global images, equal image tokens, complete captions, gr
 # Exercise real request_actor + generate with enlarged batches and per-resolution microbatches.
 request_node = next(n for n in main.body if getattr(n, "name", "") == "request_actor")
 jobs = []
-env.update(actor_client=SimpleNamespace(request=jobs.append),
+preparations = []
+env.update(actor_client=SimpleNamespace(request_prepared=preparations.append),
            captions_en=lambda rows: ["x"] * len(rows), mb=99, base_mb=1,
            microbatch_size=microbatch_size, actor_snapshot_step=0, time=time)
 exec(compile(ast.Module(body=[request_node], type_ignores=[]), "<request_actor>", "exec"), env)
 env["loader"] = stream()
 for step in steps:
     env["request_actor"](step)
+env["actor_snapshot_step"] = 999
+jobs = [prepare() for prepare in preparations]
+assert all(job["actor_step"] == 0 for job in jobs)
 
 actor = Stage(None); actor.blocks = torch.nn.ModuleList([])
 teacher = Teacher([]); teacher.stop = lambda: None

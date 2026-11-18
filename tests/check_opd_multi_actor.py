@@ -67,8 +67,8 @@ def worker(rank, path, started):
                     p.fill_(-100)
             # Requests may reach the second actor before its weights do.
             client = connections[rank]
-            client.request(dict(ids=torch.ones(2, 3, dtype=torch.long),
-                                replica=rank, actor_step=version))
+            client.request_prepared(lambda v=version: dict(ids=torch.ones(2, 3, dtype=torch.long),
+                                                          replica=rank, actor_step=v))
             cache = client.collect()
             assert cache["actor_step"] == version
             torch.testing.assert_close(cache["values"], torch.full((3,), float(version)))

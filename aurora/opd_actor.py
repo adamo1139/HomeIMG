@@ -77,6 +77,7 @@ class RolloutClient:
     def __init__(self, server, group):
         self.server, self.group = server, group
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="opd-actor-io")
+        self.prepare_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="opd-captions")
         self.pending = None
         self.snapshot_pending = None
         self.profile = False
@@ -86,6 +87,13 @@ class RolloutClient:
             raise RuntimeError("Only one future rollout batch per learner is allowed")
         # Payloads contain CPU caption IDs and strings, never mutable CUDA buffers.
         self.pending = self.pool.submit(self._request, payload)
+
+    def request_prepared(self, prepare):
+        """One CPU-only caption job; overlaps training and snapshot transport."""
+        if self.pending is not None:
+            raise RuntimeError("Only one future rollout batch per learner is allowed")
+        prepared = self.prepare_pool.submit(prepare)
+        self.pending = self.pool.submit(lambda: self._request(prepared.result()))
 
     def _request(self, payload):
         if self.snapshot_pending is not None:
@@ -145,6 +153,7 @@ class RolloutClient:
         if self.snapshot_pending is not None:
             self.snapshot_pending.result()
         self.pool.shutdown(wait=True)
+        self.prepare_pool.shutdown(wait=True)
         dist.send(torch.tensor([0, 0]), self.server, group=self.group, tag=HEADER)
 
 

@@ -1502,7 +1502,10 @@ def main():
             log(f"captions: {100 * args.pl_prob:.0f}% Polish ({alt_suffix}), the rest English")
         stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=opd_data_batches if args.opd else step,
                              sort_pad=LM_PAD if hf_lm else None, rows=args.opd,
-                             res_groups=[(r, n * k) for r, n, k in mr_groups] or None)
+                             res_groups=[(r, n * k) for r, n, k in mr_groups] or None,
+                             captions_only=args.opd_actor and not crops and isinstance(store, ShardStore))
+        if stream.captions_only:
+            log("OPD actor data: captions only; no training image/latent reads or JPEG decoding")
         loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
                                                   pin_memory=device.type == "cuda",
                                                   prefetch_factor=2 if args.workers else None,
@@ -1911,18 +1914,22 @@ def main():
             "sync timer includes capture/barriers only, unfinished preparation appears in wait")
 
     def request_actor(at):
-        # Only captions are sent to the actor. Do not run VAE/LM in the learner training loop.
-        start = time.perf_counter()
-        got = load_rollout_batch(at)
-        if has_cond:
-            got = got[:-1]
-        _, token_ids, caption_rows = got
-        actor_client.request(dict(ids=token_ids.cpu(), texts=captions_en(caption_rows.tolist()),
-                                  step=at, replica=replica, actor_step=actor_snapshot_step,
-                                  mb=microbatch_size(args, batch_resolution(args, at), base_mb)))
-        if getattr(args, "opd_actor_profile", False):
-            print(f"learner rank {rank} -> actor rank {actor_rank}: target update {at+1}, "
-                  f"caption preparation/enqueue {time.perf_counter()-start:.2f}s", flush=True)
+        # Capture version now: the CPU worker must not read a later policy version.
+        version = actor_snapshot_step
+        def prepare():
+            start = time.perf_counter()
+            got = load_rollout_batch(at)
+            if has_cond:
+                got = got[:-1]
+            _, token_ids, caption_rows = got
+            job = dict(ids=token_ids.cpu(), texts=captions_en(caption_rows.tolist()),
+                       step=at, replica=replica, actor_step=version,
+                       mb=microbatch_size(args, batch_resolution(args, at), base_mb))
+            if getattr(args, "opd_actor_profile", False):
+                print(f"learner rank {rank} -> actor rank {actor_rank}: target update {at+1}, "
+                      f"caption preparation {time.perf_counter()-start:.2f}s (background)", flush=True)
+            return job
+        actor_client.request_prepared(prepare)
 
     def refresh_actor():
         # Rank zero's complete denoiser + trainable refiner, after its preceding optimizer update.
