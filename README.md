@@ -4,11 +4,11 @@
 
 **Polsko-angielskie modele do generowania obrazów i kod do ich treningu.** HomeIMG rozwijam samodzielnie, od pierwszych eksperymentów z małym transformatorem dyfuzyjnym po dwujęzyczny model z denoiserem 1,24 mld parametrów. Tutaj udostępniam kod przygotowania danych, treningu, destylacji i oceny. Gotowe wagi EMA publikuję na Hugging Face.
 
-[Wagi na Hugging Face](https://huggingface.co/cpral?search_models=HomeIMG) · [Wygeneruj obraz](#wygeneruj-obraz) · [Wytrenuj model](docs/trening.md) · [Porównaj checkpointy](docs/ewaluacja.md)
+[Checkpoint DanceOPD 2048](https://huggingface.co/cpral/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048) · [Wygeneruj obraz](#wygeneruj-obraz) · [Wytrenuj model](docs/trening.md) · [Porównaj checkpointy](docs/ewaluacja.md)
 
-![Osiem generacji HomeIMG z polskich promptów](https://huggingface.co/cpral/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048/resolve/main/grids_cfg3/grid_pl_1024px_ts6.png)
+[![Plansza test22: 22 polskie prompty i cztery seedy](docs/images/danceopd2048-test22.jpg)](https://huggingface.co/cpral/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048/blob/main/test22/grid.jpg)
 
-*DanceOPD 2048, osiem stałych promptów PL, 1024 × 1024 px, 50 kroków Eulera, CFG 3, time shift 6. [Plansze dla obu języków i ustawienia eksperymentu](model_cards/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048/README.md).*
+*DanceOPD 2048 · 22 polskie prompty × 4 seedy (0–3), 1024 × 1024 px, CFG 3, time shift 6, 50 kroków.*
 
 ## Modele i etapy treningu
 

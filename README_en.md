@@ -4,11 +4,11 @@
 
 **Polish–English image generation models and the code I use to train them.** I develop HomeIMG independently. The project grew from a small diffusion transformer into a bilingual model with a 1.24B-parameter denoiser. This repository covers data preparation, training, distillation and evaluation. I publish EMA weights on Hugging Face.
 
-[Model weights](https://huggingface.co/cpral?search_models=HomeIMG) · [Generate an image](#generate-an-image) · [Train a model](docs/training.md) · [Compare checkpoints](docs/evaluation.md)
+[DanceOPD 2048 checkpoint](https://huggingface.co/cpral/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048) · [Generate an image](#generate-an-image) · [Train a model](docs/training.md) · [Compare checkpoints](docs/evaluation.md)
 
-![Eight DanceOPD generations from Polish prompts](https://huggingface.co/cpral/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048/resolve/main/grids_cfg3/grid_pl_1024px_ts6.png)
+[![Test22 board: 22 Polish prompts and four seeds](docs/images/danceopd2048-test22.jpg)](https://huggingface.co/cpral/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048/blob/main/test22/grid.jpg)
 
-*DanceOPD 2048, eight fixed Polish prompts, 1024 × 1024 pixels, 50 Euler steps, CFG 3 and time shift 6. [Bilingual grids and generation settings](model_cards/HomeIMG-1.2B-PL-EN-epoch49.2-DanceOPD2048/README_en.md).*
+*DanceOPD 2048 · 22 Polish prompts × 4 seeds (0–3), 1024 × 1024 px, CFG 3, time shift 6, 50 steps.*
 
 ## Models and training stages
 
