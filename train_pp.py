@@ -177,6 +177,9 @@ def get_args():
                    help="--diffusion-opd / --dance-opd: ranks holding klein (transformer + Qwen3 text encoder, ~17 GB in bf16), placed after the "
                         "training ranks and before the --lm-rank ones; every training rank splits its trajectories "
                         "over all of them")
+    p.add_argument("--teacher-gpu", type=int, default=-1, help="physical GPU for a single dedicated teacher")
+    p.add_argument("--opd-text-ahead", type=int, default=0,
+                   help="CPU queue of future batches encoded by both frozen text encoders on the LM GPU")
     p.add_argument("--klein", default="black-forest-labs/FLUX.2-klein-base-4B", help="--diffusion-opd / --dance-opd: klein base repo or dir")
     p.add_argument("--opd-cfg", type=float, default=4.0, help="--diffusion-opd / --dance-opd: the teacher's CFG scale (klein base: 4)")
     p.add_argument("--klein-quant", default="", choices=["", "int8", "fp8"],
@@ -526,6 +529,8 @@ def lm_packed_chunks(lm, plan, device, max_tokens=8192):
     hf_lm_packed: real tokens only, up to `max_tokens` per LM call) and laid out as the chunks' (rows, width, H)
     tensors the client receives; padding positions are zeros (masked downstream)."""
     from aurora.slayer import hf_lm_packed
+    if not plan:
+        return []
     masks = [sub.ne(LM_PAD) for _, _, sub in plan]
     seqs = [row[m] for (_, _, sub), mask in zip(plan, masks) for row, m in zip(sub, mask)]
     outs, pack, n = [], [], 0
@@ -548,7 +553,7 @@ def lm_packed_chunks(lm, plan, device, max_tokens=8192):
 
 
 def lm_server(te_cfg, clients, device, log, control_group, lm=None, teacher=None, opd_cfg=4.0, teacher_clients=(),
-              vae=None, serve_lm=True):
+              vae=None, serve_lm=True, text_encoder=None, text_group=None):
     """CPU/Gloo any-source control queue; hidden states still travel directly over NCCL.
 
     The optional lm argument is a small fake encoder in the distributed protocol test.
@@ -565,6 +570,7 @@ def lm_server(te_cfg, clients, device, log, control_group, lm=None, teacher=None
     # training rank, not only this server's LM clients)
     stops = {c: (c in clients) + (c in teacher_clients) for c in set(clients) | set(teacher_clients)}
     null = teacher.encode([""]) if teacher else None
+    text_null = text_encoder.encode([""]).cpu() if text_encoder is not None else None
     active, served, t0 = set(stops), 0, time.perf_counter()
     idle = compute = transfer = vae_time = 0.0
     win_t, win_n, vae_n = t0, 0, 0
@@ -578,6 +584,37 @@ def lm_server(te_cfg, clients, device, log, control_group, lm=None, teacher=None
             if not stops[r]:
                 active.remove(r)
             idle += time.perf_counter() - start
+            continue
+        if hdr[0].item() == 4:
+            assert text_encoder is not None and text_group is not None
+            from aurora.opd_text import recv_cpu_payload, send_cpu_payload
+            job = recv_cpu_payload(r, text_group)
+            ids = job["ids"]
+            plans = lm_chunk_plan(ids)
+            start_text = time.perf_counter()
+            full = torch.zeros(*ids.shape, te_cfg.lm_dim, dtype=torch.bfloat16)
+            if packed:
+                hs = lm_packed_chunks(lm, plans, device)
+                for (i, rows, sub), h in zip(plans, hs):
+                    full[:, :sub.shape[1]].index_copy_(0, rows + i, h.cpu())
+                del hs
+            else:
+                for i, rows, sub in plans:
+                    sub = sub.masked_fill(sub.eq(LM_PAD) | sub.eq(LM_NULL), 0).to(device)
+                    h = hf_lm_part(lm, sub, True, True).to(dtype=torch.bfloat16, device="cpu")
+                    full[:, :sub.shape[1]].index_copy_(0, rows + i, h)
+            from aurora.klein import tokenize
+            q_ids, q_mask = tokenize(text_encoder.tok, job["texts"])
+            # Collect on CPU per chunk: 256px jobs have many more captions than images at 1024px.
+            text = torch.empty(len(ids), *text_null.shape[1:], dtype=text_null.dtype)
+            for i in range(0, len(ids), 16):
+                text[i:i+16].copy_(text_encoder.encode_ids(q_ids[i:i+16], q_mask[i:i+16]).cpu())
+            log(f"text encoders rank {dist.get_rank()}: learner {r}, update {job['step']+1}, "
+                f"{len(ids)} captions encoded in {time.perf_counter()-start_text:.2f}s", flush=True)
+            send_cpu_payload(dict(lm=full, teacher_text=text, teacher_null=text_null,
+                                  q_ids=q_ids, q_mask=q_mask), r, text_group)
+            served += len(ids)
+            del full, text, job
             continue
         if hdr[0].item() == 3:  # --vae-on-lm: uint8 images (B, 3, H, H) in over NCCL, latents out
             imgs = torch.empty(int(hdr[1]), 3, int(hdr[2]), int(hdr[2]), dtype=torch.uint8, device=device)
@@ -770,7 +807,7 @@ def opd_rollout(stage, z, ids, lm_states, mb, ts, picks, widths=None):
     return out
 
 
-def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses, parts=2, cache=None, prepare_only=False, timings=None):
+def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses, parts=2, cache=None, prepare_only=False, timings=None, encoded_text=None):
     """One OPD step for this replica's batch (see --diffusion-opd / --dance-opd). The batch is cut into `parts`: part p+1 is rolled out
     (and later trained on) while the teachers score part p, to overlap teacher work with rollout and backward; all parts use
     this step's weights, so it stays on-policy."""
@@ -794,7 +831,8 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     shift = time_shift(args, resolution)
     ts = shift * u / (1 + (shift - 1) * u)
     with phase("tokenize"):
-        q_ids, q_mask = tokenize(qwen_tok, texts_en)
+        q_ids, q_mask = (tokenize(qwen_tok, texts_en) if encoded_text is None else
+                         (encoded_text["q_ids"], encoded_text["q_mask"]))
     states = stage.lm_states
     lm_full = torch.cat(states) if states is not None else None  # (B, L, H)
     assert parts > 0, "--opd-parts must be positive"
@@ -839,7 +877,9 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
             t = ts[picks[b0:b1].to(eps.device)].flatten()
             cap = torch.arange(b1 - b0, device=eps.device).repeat_interleave(m)
             with phase("teacher_request"):
-                current = (b0, b1, x, t, teacher.request(q_ids[b0:b1], q_mask[b0:b1], x, t, cap))
+                extra = {} if encoded_text is None else dict(text=encoded_text["teacher_text"][b0:b1],
+                                                            null=encoded_text["teacher_null"])
+                current = (b0, b1, x, t, teacher.request(q_ids[b0:b1], q_mask[b0:b1], x, t, cap, **extra))
             # Teacher scores current while the student backpropagates the previous chunk.
             # No optimizer update occurs here: all rollouts use this step's weights.
             if prepare_only:
@@ -942,7 +982,8 @@ def rollout_actor_server(stage, named, te_cfg, den_cfg, args, lm_server_rank, te
         for block in stage.blocks:
             block.compile(dynamic=False)
         stage.te.compile(dynamic=False)
-    lm = LMClient(lm_server_rank, te_cfg.lm_dim, device, control_group)
+    lm = (None if getattr(args, "opd_text_ahead", 0) else
+          LMClient(lm_server_rank, te_cfg.lm_dim, device, control_group))
     teacher = TeacherClient(teachers, device, control_group,
                             shared=[lm_server_rank] if args.teacher_on_lm else ())
     tokenizer = klein_tokenizer(args.klein)
@@ -956,7 +997,7 @@ def rollout_actor_server(stage, named, te_cfg, den_cfg, args, lm_server_rank, te
         ids_cpu, mb = job["ids"], job["mb"]
         ids = ids_cpu.to(device)
         with phase("lm"):
-            full = lm.collect(lm.request(ids_cpu))
+            full = job["lm"].to(device) if "lm" in job else lm.collect(lm.request(ids_cpu))
         stage.lm_states = [full[k:k + mb] for k in range(0, len(full), mb)]
         seed = args.seed * 1_000_003 + job["replica"] * 1009 + job["step"]
         rng = torch.Generator(device=device).manual_seed(seed)
@@ -972,7 +1013,7 @@ def rollout_actor_server(stage, named, te_cfg, den_cfg, args, lm_server_rank, te
             with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 opd_step(stage, teacher, tokenizer, job["texts"], eps, ids, ids_cpu, mb, args,
                          job["step"], job["replica"], [], parts=args.opd_parts, cache=cache, prepare_only=True,
-                         timings=timings)
+                         timings=timings, encoded_text=job if "teacher_text" in job else None)
             with phase("teacher_collect"):
                 opd_collect_prepared(teacher, cache)
             if timings is not None:
@@ -985,7 +1026,8 @@ def rollout_actor_server(stage, named, te_cfg, den_cfg, args, lm_server_rank, te
     print(f"Rollout actor rank {dist.get_rank()}: learners {clients}, frozen LM on {lm_server_rank}, "
           f"teachers {teachers}; snapshots include denoiser and trainable refiner", flush=True)
     serve_rollouts(named, clients, actor_group, generate)
-    lm.stop()
+    if lm is not None:
+        lm.stop()
     teacher.stop()
 
 
@@ -1051,6 +1093,10 @@ def main():
     assert not args.opd_actor_gpus or (args.opd_actor and args.opd_actor_gpu == -1), "Use --opd-actor-gpus with --opd-actor, without --opd-actor-gpu"
     assert len(set(args.opd_actor_gpus)) == len(args.opd_actor_gpus), "Actor GPUs must be distinct"
     assert not args.opd_actor_profile or args.opd_actor, "--opd-actor-profile needs --opd-actor"
+    assert args.opd_text_ahead >= 0
+    assert not args.opd_text_ahead or (args.opd_actor and not args.teacher_on_lm and args.teacher_ranks > 0), \
+        "--opd-text-ahead needs actors and a dedicated teacher, without --teacher-on-lm"
+    assert args.teacher_gpu < 0 or args.teacher_ranks == 1, "--teacher-gpu needs one dedicated teacher"
     actor_count = (len(args.opd_actor_gpus) or 1) if args.opd_actor else 0
     if args.opd_states is None:
         args.opd_states = 1 if args.dance_opd else 4
@@ -1098,6 +1144,15 @@ def main():
         order = [d for d in usable if d not in tail and d not in actor_gpus] + tail
         order[world:world] = actor_gpus
         local = order[int(os.environ.get("LOCAL_RANK", 0))]
+    if args.teacher_gpu >= 0:
+        assert len(usable) == world_all and args.teacher_gpu in usable
+        assert not args.lm_rank or args.lm_gpu >= 0, "--teacher-gpu needs explicit --lm-gpu placement"
+        assert all(d in usable for d in tail), "An explicitly assigned server GPU is unavailable"
+        assert args.teacher_gpu not in tail + actor_gpus
+        assert len(actor_gpus) == actor_count, "Explicit teacher placement needs explicit actor GPUs"
+        order = [d for d in usable if d not in tail + actor_gpus + [args.teacher_gpu]]
+        order += actor_gpus + [args.teacher_gpu] + tail
+        local = order[int(os.environ.get("LOCAL_RANK", 0))]
     if os.environ.get("PP_CPU"):  # tests/check_pp.py: gloo on CPU
         device = torch.device("cpu")
     else:
@@ -1123,6 +1178,7 @@ def main():
     servers = args.lm_rank or args.teacher_ranks or args.vae_rank or args.opd_actor
     control_group = dist.new_group(backend="gloo", timeout=dist_to) if servers else None
     actor_group = dist.new_group(backend="gloo", timeout=dist_to) if args.opd_actor else None
+    text_group = dist.new_group(backend="gloo", timeout=dist_to) if args.opd_text_ahead else None
     train_group = dist.new_group(list(range(world)), timeout=dist_to) if servers else None  # None = everyone
     # Every barrier below specifies device_ids: with --lm-gpu, rank % device_count
     # may select another process's GPU and poison this group's first NCCL communicator.
@@ -1195,7 +1251,7 @@ def main():
         if rank in teachers and rank not in lm_servers:
             from aurora.klein import teacher_server
             teacher_server(args.klein, teacher_clients, device, print, control_group, args.opd_cfg,
-                           args.klein_quant, compile=not args.no_compile)
+                           args.klein_quant, compile=not args.no_compile, preencoded=bool(args.opd_text_ahead))
             dist.destroy_process_group()
             return
     assert not args.vae_rank or (args.lm_rank and args.img_dir and not args.vae_on_lm), \
@@ -1217,11 +1273,15 @@ def main():
             vae = (LatentEncoder(args.enc_vae, device, args.enc_chunk, compile=not args.no_compile)
                    if args.vae_on_lm else None)
             lm_clients = [r * pp for r in range(replicas) if r % args.lm_rank == k]
-            if args.opd_actor:
+            if args.opd_actor and not args.opd_text_ahead:
                 lm_clients.extend(actor_ranks)
+            text_encoder = None
+            if args.opd_text_ahead:
+                from aurora.klein import KleinTeacher
+                text_encoder = KleinTeacher(device, args.klein, quant=args.klein_quant, transformer=False)
             lm_server(te_cfg, lm_clients, device, print, control_group,
                       teacher=teacher, opd_cfg=args.opd_cfg, teacher_clients=teacher_clients if teacher else (),
-                      vae=vae)
+                      vae=vae, text_encoder=text_encoder, text_group=text_group)
             dist.destroy_process_group()
             return
     assert not args.vae_on_lm or (args.lm_rank and args.img_dir), "--vae-on-lm needs --lm-rank and --img-dir"
@@ -1913,10 +1973,31 @@ def main():
         log("OPD actor snapshots: immutable CPU capture, asynchronous transfer/install; "
             "sync timer includes capture/barriers only, unfinished preparation appears in wait")
 
+    text_lookahead = None
+    if args.opd_text_ahead:
+        from aurora.opd_text import TextLookahead, encode_remote
+        def prepare_text_job(at):
+            got = load_rollout_batch(at)
+            if has_cond:
+                got = got[:-1]
+            _, token_ids, caption_rows = got
+            return dict(ids=token_ids.cpu(), texts=captions_en(caption_rows.tolist()),
+                        step=at, replica=replica,
+                        mb=microbatch_size(args, batch_resolution(args, at), base_mb))
+        text_lookahead = TextLookahead(prepare_text_job,
+            lambda job: encode_remote(job, lm_servers[0], control_group, text_group),
+            step, args.steps, args.opd_reuse, args.opd_text_ahead)
+        log(f"OPD text queue: {args.opd_text_ahead} future batches per learner in CPU RAM; "
+            "Poziomka and Qwen encoded ahead, no policy snapshots in text cache; rebuilt on resume")
+
     def request_actor(at):
         # Capture version now: the CPU worker must not read a later policy version.
         version = actor_snapshot_step
         def prepare():
+            if text_lookahead is not None:
+                job = text_lookahead.take(at)
+                job["actor_step"] = version
+                return job
             start = time.perf_counter()
             got = load_rollout_batch(at)
             if has_cond:
@@ -2328,6 +2409,8 @@ def main():
     if actor_client is not None:
         for connection in actor_connections:
             connection.stop()
+    if text_lookahead is not None:
+        text_lookahead.close()
     if lm_client is not None:
         lm_client.stop()
     if vae_client is not None and vae_client is not lm_client:

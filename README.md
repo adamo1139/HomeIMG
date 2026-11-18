@@ -249,6 +249,29 @@ Pierwsze wystąpienie każdej rozdzielczości może wymagać kompilacji nowych g
 
 Test CPU: `PYTHONPATH=. python tests/check_opd_resolution.py`.
 
+### Kolejka zamrożonych stanów tekstowych
+
+`--opd-text-ahead 4` przygotowuje cztery przyszłe batche na ucznia, niezależnie
+od aktora. Jeden wątek czyta captiony w kolejności harmonogramu rozdzielczości,
+a osobny GPU koduje zarówno Poziomkę (przed trenowanym refinerem), jak i Qwena
+teachera. Stany BF16 czekają w RAM; kolejka nie rośnie z długością treningu.
+Limit dotyczy czterech przyszłych batchów, oprócz aktualnie konsumowanego.
+Log podaje rozmiar stanów każdego batcha w MiB. Po wznowieniu kolejka jest
+odbudowywana od zapisanej, zużytej pozycji danych. Nie zapisujemy jej do checkpointu.
+
+Ten tryb wymaga `--opd-actor`, jednego serwera LM i dedykowanego teachera;
+nie łączy się z `--teacher-on-lm`. Przykładowe rozmieszczenie siedmiu ranków:
+`--skip-gpus 0 --opd-actor-gpus 2 7 --teacher-ranks 1 --teacher-gpu 4 --lm-rank 1 --lm-gpu 6`.
+Uczniowie zajmują wtedy GPU 1/3/5, aktorzy 2/7, teacher obrazu 4, oba encodery
+tekstu 6. Przy `--batch 30 --opd-token-batch` globalne batche to 480/120/30.
+Na GPU teachera nie jest ładowany Qwen. Rozmiary cache i wydajność należy
+sprawdzić benchmarkiem; gotowość tekstu nie oznacza gotowości rolloutów.
+Wersja wag aktora jest przypisywana dopiero przy wysłaniu zadania, więc dłuższa
+kolejka tekstu nie zwiększa dopuszczalnego wieku polityki.
+
+Test protokołu (CPU, cztery procesy Gloo):
+`PYTHONPATH=.:tests python tests/check_opd_text_queue.py`.
+
 ## Struktura
 
 | plik | co robi |

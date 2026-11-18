@@ -23,18 +23,21 @@ def check_layout():
     end = next(i for i, n in enumerate(main.body) if isinstance(n, ast.If)
                and ast.unparse(n.test) == "os.environ.get('PP_CPU')")
     code = compile(ast.Module(body=main.body[start:end], type_ignores=[]), "<rank-layout>", "exec")
-    for gpus, expected in [([2, 7], [1, 3, 5, 6, 2, 7, 4]), ([], [1, 3, 5, 6, 7, 2, 4])]:
-        args = SimpleNamespace(lm_rank=1, teacher_ranks=0, vae_rank=0, teacher_on_lm=True,
-                               opd_actor=True, skip_gpus=[0], lm_gpu=4, vae_gpu=0,
-                               opd_actor_gpus=gpus, opd_actor_gpu=-1 if gpus else 2)
+    for gpus, teacher_gpu, expected in [([2, 7], -1, [1, 3, 5, 6, 2, 7, 4]),
+                                       ([], -1, [1, 3, 5, 6, 7, 2, 4]),
+                                       ([2, 7], 4, [1, 3, 5, 2, 7, 4, 6])]:
+        separate = teacher_gpu >= 0
+        args = SimpleNamespace(lm_rank=1, teacher_ranks=int(separate), vae_rank=0, teacher_on_lm=not separate,
+                               opd_actor=True, skip_gpus=[0], lm_gpu=6 if separate else 4, vae_gpu=0,
+                               opd_actor_gpus=gpus, opd_actor_gpu=-1 if gpus else 2, teacher_gpu=teacher_gpu)
         for rank in range(7):
             env = dict(args=args, world_all=7, rank=rank, pp=1, actor_count=len(gpus) or 1,
                        torch=torch, os=os)
             with patch.dict(os.environ, LOCAL_RANK=str(rank)), patch("torch.cuda.device_count", return_value=8):
                 exec(code, env)
             assert env["local"] == expected[rank]
-            assert env["teachers"] == [6]
-            assert env["teacher_clients"] == ([4, 5] if gpus else [5])
+            assert env["teachers"] == ([5] if separate else [6])
+            assert env["teacher_clients"] == ([3, 4] if separate else [4, 5] if gpus else [5])
     print("PASS: production rank layout, physical GPU mapping and teacher clients for one/two actors")
 
 
@@ -49,6 +52,7 @@ def worker(rank, path, started):
     if rank >= 2:
         def generate(job):
             assert job["replica"] == rank - 2
+            torch.testing.assert_close(job["teacher_text"], torch.arange(6).reshape(2, 3).t())
             started[rank - 2].set()
             # Neither actor can finish until both are generating: proves overlap.
             assert started[3 - rank].wait(30)
@@ -68,7 +72,8 @@ def worker(rank, path, started):
             # Requests may reach the second actor before its weights do.
             client = connections[rank]
             client.request_prepared(lambda v=version: dict(ids=torch.ones(2, 3, dtype=torch.long),
-                                                          replica=rank, actor_step=v))
+                                                          replica=rank, actor_step=v,
+                                                          teacher_text=torch.arange(6).reshape(2, 3).t()))
             cache = client.collect()
             assert cache["actor_step"] == version
             torch.testing.assert_close(cache["values"], torch.full((3,), float(version)))

@@ -86,10 +86,11 @@ class KleinTeacher:
     LAYERS = (9, 18, 27)
 
     def __init__(self, device, repo: str = REPO, dtype=torch.bfloat16, text_encoder: bool = True, quant: str = "",
-                 compile: bool = False):
+                 compile: bool = False, transformer: bool = True):
         from diffusers import Flux2Transformer2DModel
         self.device, self.dtype = device, dtype
-        self.transformer = Flux2Transformer2DModel.from_pretrained(repo, subfolder="transformer", torch_dtype=dtype)
+        self.transformer = (Flux2Transformer2DModel.from_pretrained(repo, subfolder="transformer", torch_dtype=dtype)
+                            if transformer else None)
         self.te = self.tok = None
         if text_encoder:
             from transformers import Qwen3ForCausalLM
@@ -105,7 +106,7 @@ class KleinTeacher:
                 if quant:
                     quantize(mod, quant)
                 mod.to(device).eval().requires_grad_(False)
-        if compile:
+        if compile and self.transformer is not None:
             self.transformer = torch.compile(self.transformer)
 
     @torch.no_grad()
@@ -190,18 +191,25 @@ def serve_request(teacher, null, r, hdr, control_group, device, cfg: float, micr
     cap = torch.empty(n, dtype=torch.long, device=device)
     for buf in (x, t, cap):
         dist.recv(buf, src=r)
-    text = teacher.encode_ids(ids, mask)
+    if int(hdr[0]) == 4:
+        text = torch.empty(nc, 512, 7680, dtype=teacher.dtype, device=device)
+        null = torch.empty(1, 512, 7680, dtype=teacher.dtype, device=device)
+        dist.recv(text, src=r)
+        dist.recv(null, src=r)
+    else:
+        text = teacher.encode_ids(ids, mask)
     v = torch.cat([teacher.velocity(x[i:i + micro].float(), t[i:i + micro], text[cap[i:i + micro]], null, cfg)
                    for i in range(0, n, micro)]).to(torch.bfloat16).contiguous()
     dist.send(v, dst=r)
     return n
 
 
-def teacher_server(repo, clients, device, log, control_group, cfg: float = 4.0, quant: str = "", compile: bool = False):
+def teacher_server(repo, clients, device, log, control_group, cfg: float = 4.0, quant: str = "", compile: bool = False,
+                   preencoded: bool = False):
     import time
     import torch.distributed as dist
-    teacher = KleinTeacher(device, repo, quant=quant, compile=compile)
-    null = teacher.encode([""])
+    teacher = KleinTeacher(device, repo, quant=quant, compile=compile, text_encoder=not preencoded)
+    null = None if preencoded else teacher.encode([""])
     log(f"teacher server (rank {dist.get_rank()}): {repo}{' (' + quant + ')' if quant else ''}, CFG {cfg}, "
         f"for ranks {sorted(clients)}", flush=True)
     active, served, t0 = set(clients), 0, time.perf_counter()
@@ -239,7 +247,7 @@ class TeacherClient:
         self.request_index = 0
         self.tag = {s: (1 if s in set(shared) else TAG_HDR) for s in self.servers}
 
-    def request(self, ids, mask, x, t, cap):
+    def request(self, ids, mask, x, t, cap, text=None, null=None):
         """cap: caption index of every state, non-decreasing (states grouped by trajectory)."""
         import torch.distributed as dist
         n, _, h, w = x.shape
@@ -255,12 +263,16 @@ class TeacherClient:
             if c1 == c0:
                 continue
             s0, s1 = int(torch.searchsorted(cap_cpu, c0)), int(torch.searchsorted(cap_cpu, c1))
-            ctrl = [torch.tensor([KIND_TEACHER, s1 - s0, c1 - c0], dtype=torch.long), torch.tensor([h, w]),
+            ctrl = [torch.tensor([4 if text is not None else KIND_TEACHER, s1 - s0, c1 - c0], dtype=torch.long), torch.tensor([h, w]),
                     ids[c0:c1].contiguous(), mask[c0:c1].contiguous()]
             reqs = [dist.isend(c, dst=server, group=self.group, tag=tag)
                     for c, tag in zip(ctrl, (self.tag[server], TAG_HW, TAG_IDS, TAG_MASK))]
             bufs = [x[s0:s1].to(torch.bfloat16).contiguous(), t[s0:s1].float().contiguous(),
                     (cap[s0:s1] - c0).long().contiguous()]
+            if text is not None:
+                assert null is not None
+                bufs += [text[c0:c1].to(self.device, dtype=torch.bfloat16).contiguous(),
+                         null.to(self.device, dtype=torch.bfloat16).contiguous()]
             reqs += [dist.isend(b, dst=server) for b in bufs]
             out = torch.empty(s1 - s0, 128, h, w, dtype=torch.bfloat16, device=self.device)
             reqs.append(dist.irecv(out, src=server))

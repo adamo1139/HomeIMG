@@ -77,7 +77,7 @@ jobs = []
 preparations = []
 env.update(actor_client=SimpleNamespace(request_prepared=preparations.append),
            captions_en=lambda rows: ["x"] * len(rows), mb=99, base_mb=1,
-           microbatch_size=microbatch_size, actor_snapshot_step=0, time=time)
+           microbatch_size=microbatch_size, actor_snapshot_step=0, time=time, text_lookahead=None)
 exec(compile(ast.Module(body=[request_node], type_ignores=[]), "<request_actor>", "exec"), env)
 env["loader"] = stream()
 for step in steps:
@@ -95,6 +95,20 @@ def serve_balanced(named, clients, group, generate):
         mb_res = microbatch_size(args, res, 1)
         assert len(job["ids"]) == len(job["texts"]) == n and job["mb"] == mb_res
         cache = generate(job)
+        # Frozen text states from the queue must produce exactly the same rollout/targets.
+        q_ids, q_mask = fake.tokenize(None, job["texts"])
+        cached_job = dict(job, lm=lm.collect(job["ids"]), q_ids=q_ids, q_mask=q_mask,
+                          teacher_text=torch.zeros(n, 2, 2), teacher_null=torch.zeros(1, 2, 2))
+        original_request = teacher.request
+        def preencoded_request(ids, mask, x, t, cap, text=None, null=None):
+            assert text is not None and len(text) == len(ids) and null is not None
+            return original_request(ids, mask, x, t, cap)
+        with patch.object(teacher, "request", side_effect=preencoded_request), \
+             patch.object(lm, "request", side_effect=AssertionError("Unexpected online LM request")):
+            cached = generate(cached_job)
+        for a, b in zip(cache["chunks"], cached["chunks"]):
+            for x, y in zip(a[2:], b[2:]):
+                torch.testing.assert_close(x, y, rtol=0, atol=0)
         assert all(value >= 0 for value in cache["actor_timings"].values())
         assert {"lm_wall", "rollout_wall", "teacher_request_wall", "teacher_collect_wall"} <= cache["actor_timings"].keys()
         assert len(cache["ids"]) == n and cache["resolution"] == res

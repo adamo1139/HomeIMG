@@ -98,8 +98,13 @@ class RolloutClient:
     def _request(self, payload):
         if self.snapshot_pending is not None:
             self.snapshot_pending.result()  # surface an install/ACK failure before requesting work
-        dist.send(torch.tensor([1, 0]), self.server, group=self.group, tag=HEADER)
-        dist.send_object_list([payload], self.server, group=self.group)
+        encoded = "teacher_text" in payload
+        dist.send(torch.tensor([3 if encoded else 1, 0]), self.server, group=self.group, tag=HEADER)
+        if encoded:
+            from aurora.opd_text import send_cpu_payload
+            send_cpu_payload(payload, self.server, self.group)
+        else:
+            dist.send_object_list([payload], self.server, group=self.group)
         result = [None]
         dist.recv_object_list(result, self.server, group=self.group)
         return result[0]
@@ -204,9 +209,13 @@ def serve_rollouts(named, clients, group, generate):
                     p.copy_(cpu)
             version = int(hdr[1])
             dist.send(torch.tensor([version]), src, group=group, tag=ACK)
-        elif kind == 1:
-            payload = [None]
-            dist.recv_object_list(payload, src, group=group)
+        elif kind in (1, 3):
+            if kind == 3:
+                from aurora.opd_text import recv_cpu_payload
+                payload = [recv_cpu_payload(src, group)]
+            else:
+                payload = [None]
+                dist.recv_object_list(payload, src, group=group)
             requested = payload[0].get("actor_step", version)
             if requested is None:
                 raise RuntimeError("Actor must receive initial learner snapshot before requests")
