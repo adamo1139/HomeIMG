@@ -5,11 +5,50 @@ receives the next cache while its main thread runs CUDA backward. CUDA work and
 model snapshots remain on the main thread; no live model is shared with workers.
 """
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import time
 
 import torch
 import torch.distributed as dist
 
 HEADER, WEIGHTS, ACK = 310, 311, 312
+
+
+def capture_snapshot(named):
+    """One immutable CPU copy may be shared by multiple actor transport threads."""
+    return [(kind, name, p.detach().to(device="cpu", copy=True).contiguous())
+            for kind, name, p in named]
+
+
+class ActorTimings:
+    """Wall times plus CUDA stream spans; overlapping spans must not be summed."""
+    def __init__(self, device):
+        self.device = device
+        self.wall, self.events = {}, []
+
+    @contextmanager
+    def measure(self, name):
+        cuda = self.device.type == "cuda"
+        if cuda:
+            a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            a.record()
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.wall[name] = self.wall.get(name, 0.) + time.perf_counter() - start
+            if cuda:
+                b.record()
+                self.events.append((name, a, b))
+
+    def finish(self):
+        result = {name + "_wall": value for name, value in self.wall.items()}
+        if self.events:
+            torch.cuda.synchronize(self.device)
+            for name, a, b in self.events:
+                key = name + "_cuda_span"
+                result[key] = result.get(key, 0.) + a.elapsed_time(b) / 1000
+        return result
 
 
 def tree_to(value, device):
@@ -40,6 +79,7 @@ class RolloutClient:
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="opd-actor-io")
         self.pending = None
         self.snapshot_pending = None
+        self.profile = False
 
     def request(self, payload):
         if self.pending is not None:
@@ -69,6 +109,7 @@ class RolloutClient:
         Use original parameter dtype: transport must not quantize the actor's
         policy. Streaming one parameter at a time avoids another full CPU model.
         """
+        start = time.perf_counter()
         dist.send(torch.tensor([2, step]), self.server, group=self.group, tag=HEADER)
         for _, _, p in named:
             dist.send(p.detach().cpu().contiguous(), self.server, group=self.group, tag=WEIGHTS)
@@ -76,6 +117,9 @@ class RolloutClient:
         dist.recv(ack, self.server, group=self.group, tag=ACK)
         if int(ack[0]) != step:
             raise RuntimeError("Rollout snapshot acknowledgement mismatch")
+        if self.profile:
+            print(f"actor snapshot v{step} -> rank {self.server}: transfer/install/ACK "
+                  f"{time.perf_counter()-start:.2f}s (background)", flush=True)
 
     def update_async(self, named, step):
         """Freeze CPU storage before returning; the worker never reads live parameters.
@@ -83,14 +127,16 @@ class RolloutClient:
         Snapshot capture intentionally blocks the main thread until D2H completes.
         Only transport/install/ACK overlap subsequent optimizer updates.
         """
+        self.send_snapshot_async(capture_snapshot(named), step)
+
+    def send_snapshot_async(self, snapshot, step):
+        """Enqueue an already immutable CPU snapshot (possibly shared across actors)."""
         if self.snapshot_pending is not None:
             if not self.snapshot_pending.done():
                 raise RuntimeError("Only one outstanding actor snapshot is allowed")
             self.snapshot_pending.result()
         if self.pending is not None:
             raise RuntimeError("Collect the previous rollout before updating the actor")
-        snapshot = [(kind, name, p.detach().to(device="cpu", copy=True).contiguous())
-                    for kind, name, p in named]
         self.snapshot_pending = self.pool.submit(self.update, snapshot, step)
 
     def stop(self):
@@ -113,11 +159,21 @@ def serve_rollouts(named, clients, group, generate):
                       if version is not None and job.get("actor_step", version) == version), None)
         if ready is not None:
             payload = queued.pop(ready)
+            started = time.perf_counter()
             with torch.no_grad():
                 cache = generate(payload)
             cache["actor_step"] = version
+            generated = time.perf_counter()
             cache = tree_to(cache, "cpu")
+            copied = time.perf_counter()
             dist.send_object_list([cache], ready, group=group)
+            sent = time.perf_counter()
+            if "actor_timings" in cache:
+                phases = " ".join(f"{k}={v:.2f}s" for k, v in cache["actor_timings"].items())
+                print(f"actor rank {dist.get_rank()} -> learner {ready}, v{version}, "
+                      f"{cache['resolution']}px {len(cache['ids'])} images: {phases} "
+                      f"generate_total={generated-started:.2f}s cpu_copy={copied-generated:.2f}s "
+                      f"send={sent-copied:.2f}s total={sent-started:.2f}s", flush=True)
             del cache, payload
             continue
         hdr = torch.empty(2, dtype=torch.long)

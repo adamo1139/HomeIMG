@@ -187,9 +187,13 @@ def get_args():
                         "states like the --teacher-ranks; that GPU is otherwise ~99%% idle during OPD")
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--diffusion-opd / --dance-opd: Euler steps of the student's trajectories")
     p.add_argument("--opd-actor", action="store_true",
-                   help="one dedicated rollout GPU; fresh snapshot at cycle start, next batch generated during replay")
+                   help="dedicated rollout GPU(s); fresh snapshot at cycle start, next batch generated during replay")
     p.add_argument("--opd-actor-gpu", type=int, default=-1,
                    help="GPU for the rollout actor in CUDA_DEVICE_ORDER numbering; -1 uses rank order; needs --opd-actor")
+    p.add_argument("--opd-actor-gpus", type=int, nargs="+", default=[],
+                   help="dedicated actor GPUs, e.g. 2 7; replaces --opd-actor-gpu, learners assigned round-robin")
+    p.add_argument("--opd-actor-profile", action="store_true",
+                   help="log actor LM, rollout, teacher, CPU-copy and send timings per learner job")
     p.add_argument("--opd-prefetch", action="store_true",
                    help="prepare one future OPD cache during replay; needs reuse > 1 and an LM server; rollouts are stale")
     p.add_argument("--opd-state-weighting", action="store_true",
@@ -766,13 +770,15 @@ def opd_rollout(stage, z, ids, lm_states, mb, ts, picks, widths=None):
     return out
 
 
-def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses, parts=2, cache=None, prepare_only=False):
+def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, step, replica, losses, parts=2, cache=None, prepare_only=False, timings=None):
     """One OPD step for this replica's batch (see --diffusion-opd / --dance-opd). The batch is cut into `parts`: part p+1 is rolled out
     (and later trained on) while the teachers score part p, to overlap teacher work with rollout and backward; all parts use
     this step's weights, so it stays on-policy."""
     assert not prepare_only or cache is not None, "prepare-only needs a cache"
     from aurora.klein import tokenize
     from aurora.opd_resolution import time_shift
+    from contextlib import nullcontext
+    phase = timings.measure if timings is not None else lambda name: nullcontext()
     B, m, K = eps.shape[0], args.opd_states, args.opd_rollout_steps
     g = torch.Generator().manual_seed(args.seed * 1_000_003 + replica * 1009 + step + 7)
     if args.dance_opd:  # DanceOPD: Beta(A, B) (--dance-beta, the paper's 5 2) over the normalised trajectory
@@ -787,7 +793,8 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
     resolution = eps.shape[-1] * 16
     shift = time_shift(args, resolution)
     ts = shift * u / (1 + (shift - 1) * u)
-    q_ids, q_mask = tokenize(qwen_tok, texts_en)
+    with phase("tokenize"):
+        q_ids, q_mask = tokenize(qwen_tok, texts_en)
     states = stage.lm_states
     lm_full = torch.cat(states) if states is not None else None  # (B, L, H)
     assert parts > 0, "--opd-parts must be positive"
@@ -826,11 +833,13 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
             assert ((b1 - b0) * m) % mb == 0, "OPD chunk states must fill training micro-batches"
             ids_c = ids_cpu[b0:b1] if ids_cpu is not None else None
             widths = text_widths(ids_c, mb, args.text_bucket) if ids_c is not None and args.text_bucket else None
-            x = opd_rollout(stage, eps[b0:b1], ids[b0:b1], lm_full[b0:b1] if lm_full is not None else None, mb, ts,
-                            picks[b0:b1], widths).flatten(0, 1)
+            with phase("rollout"):
+                x = opd_rollout(stage, eps[b0:b1], ids[b0:b1], lm_full[b0:b1] if lm_full is not None else None, mb, ts,
+                                picks[b0:b1], widths).flatten(0, 1)
             t = ts[picks[b0:b1].to(eps.device)].flatten()
             cap = torch.arange(b1 - b0, device=eps.device).repeat_interleave(m)
-            current = (b0, b1, x, t, teacher.request(q_ids[b0:b1], q_mask[b0:b1], x, t, cap))
+            with phase("teacher_request"):
+                current = (b0, b1, x, t, teacher.request(q_ids[b0:b1], q_mask[b0:b1], x, t, cap))
             # Teacher scores current while the student backpropagates the previous chunk.
             # No optimizer update occurs here: all rollouts use this step's weights.
             if prepare_only:
@@ -940,9 +949,14 @@ def rollout_actor_server(stage, named, te_cfg, den_cfg, args, lm_server_rank, te
 
     def generate(job):
         from aurora.opd_resolution import batch_resolution
+        from aurora.opd_actor import ActorTimings
+        from contextlib import nullcontext
+        timings = ActorTimings(device) if getattr(args, "opd_actor_profile", False) else None
+        phase = timings.measure if timings is not None else lambda name: nullcontext()
         ids_cpu, mb = job["ids"], job["mb"]
         ids = ids_cpu.to(device)
-        full = lm.collect(lm.request(ids_cpu))
+        with phase("lm"):
+            full = lm.collect(lm.request(ids_cpu))
         stage.lm_states = [full[k:k + mb] for k in range(0, len(full), mb)]
         seed = args.seed * 1_000_003 + job["replica"] * 1009 + job["step"]
         rng = torch.Generator(device=device).manual_seed(seed)
@@ -957,8 +971,12 @@ def rollout_actor_server(stage, named, te_cfg, den_cfg, args, lm_server_rank, te
         try:
             with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 opd_step(stage, teacher, tokenizer, job["texts"], eps, ids, ids_cpu, mb, args,
-                         job["step"], job["replica"], [], parts=args.opd_parts, cache=cache, prepare_only=True)
-            opd_collect_prepared(teacher, cache)
+                         job["step"], job["replica"], [], parts=args.opd_parts, cache=cache, prepare_only=True,
+                         timings=timings)
+            with phase("teacher_collect"):
+                opd_collect_prepared(teacher, cache)
+            if timings is not None:
+                cache["actor_timings"] = timings.finish()
             cache["generation_seconds"] = time.perf_counter() - generation_start
         finally:
             stage.lm_states = None
@@ -1030,6 +1048,10 @@ def main():
                                  and not args.vae_on_lm), "--opd-actor needs OPD, pp=1, one LM, reuse>1; no local prefetch/REPA/VAE server"
     assert args.opd_actor_gpu >= -1, "--opd-actor-gpu must be -1 or a GPU index"
     assert args.opd_actor or args.opd_actor_gpu == -1, "--opd-actor-gpu needs --opd-actor"
+    assert not args.opd_actor_gpus or (args.opd_actor and args.opd_actor_gpu == -1), "Use --opd-actor-gpus with --opd-actor, without --opd-actor-gpu"
+    assert len(set(args.opd_actor_gpus)) == len(args.opd_actor_gpus), "Actor GPUs must be distinct"
+    assert not args.opd_actor_profile or args.opd_actor, "--opd-actor-profile needs --opd-actor"
+    actor_count = (len(args.opd_actor_gpus) or 1) if args.opd_actor else 0
     if args.opd_states is None:
         args.opd_states = 1 if args.dance_opd else 4
     # long timeout: at 1024 px the held-out encoding / LM states and every eval take ~10 min on rank 0 while the
@@ -1039,14 +1061,16 @@ def main():
     rank, world_all = dist.get_rank(), dist.get_world_size()
     pp = args.pp
     # training ranks first, then --teacher-ranks (klein, OPD), then the --lm-rank LM servers, then the --vae-rank
-    world = world_all - args.lm_rank - args.teacher_ranks - args.vae_rank - int(args.opd_actor)
+    world = world_all - args.lm_rank - args.teacher_ranks - args.vae_rank - actor_count
     assert world > 0, "At least one learner is required"
-    actor_rank = world if args.opd_actor else None
-    teacher_start = world + int(args.opd_actor)
+    actor_ranks = list(range(world, world + actor_count))
+    assert actor_count <= world, "Each actor needs at least one learner"
+    actor_rank = actor_ranks[rank % actor_count] if actor_count else None
+    teacher_start = world + actor_count
     lm_servers = list(range(teacher_start + args.teacher_ranks, world_all - args.vae_rank))
     vae_servers = list(range(world_all - args.vae_rank, world_all))
     teachers = list(range(teacher_start, teacher_start + args.teacher_ranks)) + (lm_servers if args.teacher_on_lm else [])
-    teacher_clients = [actor_rank] if args.opd_actor else list(range(world))
+    teacher_clients = actor_ranks if args.opd_actor else list(range(world))
     assert world % pp == 0, f"{world} training ranks are not a multiple of --pp {pp}"
     replicas = world // pp
     replica, s = divmod(rank, pp) if rank < world else (-1, 0)
@@ -1066,13 +1090,13 @@ def main():
         local = order[int(os.environ.get("LOCAL_RANK", 0))]
     elif args.skip_gpus:
         local = usable[int(os.environ.get("LOCAL_RANK", 0))]
-    if args.opd_actor_gpu >= 0:
+    actor_gpus = args.opd_actor_gpus or ([args.opd_actor_gpu] if args.opd_actor_gpu >= 0 else [])
+    if actor_gpus:
         assert len(usable) == world_all, "Explicit actor GPU placement needs one local GPU per rank"
-        assert args.opd_actor_gpu in usable, "--opd-actor-gpu is missing or excluded by --skip-gpus"
+        assert all(d in usable and d not in tail for d in actor_gpus), "Actor GPUs must be available and differ from LM/VAE"
         assert all(d in usable for d in tail), "An explicitly assigned server GPU is unavailable"
-        assert args.opd_actor_gpu not in tail, "Actor GPU must differ from LM and VAE GPUs"
-        order = [d for d in usable if d not in tail and d != args.opd_actor_gpu] + tail
-        order.insert(actor_rank, args.opd_actor_gpu)
+        order = [d for d in usable if d not in tail and d not in actor_gpus] + tail
+        order[world:world] = actor_gpus
         local = order[int(os.environ.get("LOCAL_RANK", 0))]
     if os.environ.get("PP_CPU"):  # tests/check_pp.py: gloo on CPU
         device = torch.device("cpu")
@@ -1080,7 +1104,7 @@ def main():
         torch.cuda.set_device(local)
         device = torch.device("cuda", local)
         if rank >= world:  # servers: say which physical card they got (nvidia-smi shows the same bus id)
-            role = "rollout actor" if rank == actor_rank else "VAE server" if rank in vae_servers else "LM server" if rank in lm_servers else "teacher"
+            role = "rollout actor" if rank in actor_ranks else "VAE server" if rank in vae_servers else "LM server" if rank in lm_servers else "teacher"
             print(f"rank {rank} ({role}): GPU {local}, PCI bus {torch.cuda.get_device_properties(local).pci_bus_id:02X}",
                   flush=True)
     master = rank == 0
@@ -1194,7 +1218,7 @@ def main():
                    if args.vae_on_lm else None)
             lm_clients = [r * pp for r in range(replicas) if r % args.lm_rank == k]
             if args.opd_actor:
-                lm_clients.append(actor_rank)
+                lm_clients.extend(actor_ranks)
             lm_server(te_cfg, lm_clients, device, print, control_group,
                       teacher=teacher, opd_cfg=args.opd_cfg, teacher_clients=teacher_clients if teacher else (),
                       vae=vae)
@@ -1301,7 +1325,7 @@ def main():
         log(f"init: {old_depth} blocks + stem + head{' + text encoder' if keep_te else ''} ({src}) from {args.init} "
             f"(step {init_ck.get('step')}); blocks {old_depth}..{den_cfg.depth - 1} new, zero output projections")
     del init_ck
-    if rank == actor_rank:
+    if rank in actor_ranks:
         rollout_actor_server(stage_mod, named, te_cfg, den_cfg, args, lm_servers[0], teachers,
                              list(range(world)), device, control_group, actor_group)
         dist.destroy_process_group()
@@ -1873,17 +1897,22 @@ def main():
     opd_cache, opd_pass = {}, 0
     opd_next = None  # one-batch lookahead; not checkpointed or counted as consumed until trained
     actor_client = None
+    actor_connections = []
     actor_snapshot_step = None
     if args.opd_actor:
-        from aurora.opd_actor import RolloutClient, cache_to_device
-        actor_client = RolloutClient(actor_rank, actor_group)
-        log(f"OPD actor rank {actor_rank}: snapshots from learner rank 0, reuse {args.opd_reuse}, "
+        from aurora.opd_actor import RolloutClient, cache_to_device, capture_snapshot
+        actor_connections = [RolloutClient(ar, actor_group) for ar in actor_ranks]
+        for connection in actor_connections:
+            connection.profile = args.opd_actor_profile
+        actor_client = actor_connections[rank % actor_count]
+        log(f"OPD actor ranks {actor_ranks}, learner assignment round-robin: snapshots from learner rank 0, reuse {args.opd_reuse}, "
             f"fresh snapshot each cycle; maximum cached-state age {2 * args.opd_reuse - 1} updates; one-batch CPU queue")
         log("OPD actor snapshots: immutable CPU capture, asynchronous transfer/install; "
             "sync timer includes capture/barriers only, unfinished preparation appears in wait")
 
     def request_actor(at):
         # Only captions are sent to the actor. Do not run VAE/LM in the learner training loop.
+        start = time.perf_counter()
         got = load_rollout_batch(at)
         if has_cond:
             got = got[:-1]
@@ -1891,6 +1920,9 @@ def main():
         actor_client.request(dict(ids=token_ids.cpu(), texts=captions_en(caption_rows.tolist()),
                                   step=at, replica=replica, actor_step=actor_snapshot_step,
                                   mb=microbatch_size(args, batch_resolution(args, at), base_mb)))
+        if getattr(args, "opd_actor_profile", False):
+            print(f"learner rank {rank} -> actor rank {actor_rank}: target update {at+1}, "
+                  f"caption preparation/enqueue {time.perf_counter()-start:.2f}s", flush=True)
 
     def refresh_actor():
         # Rank zero's complete denoiser + trainable refiner, after its preceding optimizer update.
@@ -1901,7 +1933,9 @@ def main():
         # the policy: every shard of a global cache must use the same snapshot.
         dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
         if master and actor_snapshot_step != step:
-            actor_client.update_async(named, step)
+            snapshot = capture_snapshot(named)
+            for connection in actor_connections:
+                connection.send_snapshot_async(snapshot, step)
         # This barrier only waits for immutable CPU capture and enqueue. Actor
         # requests carry the required version; no learner waits for its install.
         dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
@@ -2285,7 +2319,8 @@ def main():
 
     profile.close()
     if actor_client is not None:
-        actor_client.stop()
+        for connection in actor_connections:
+            connection.stop()
     if lm_client is not None:
         lm_client.stop()
     if vae_client is not None and vae_client is not lm_client:
