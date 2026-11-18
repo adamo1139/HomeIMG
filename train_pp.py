@@ -212,6 +212,8 @@ def get_args():
                    help="one resolution per fresh rollout batch, unchanged throughout replay; e.g. 256 512 1024")
     p.add_argument("--opd-res-weights", type=float, nargs="+", default=[],
                    help="relative probabilities of fresh batches, NOT token proportions; default: equal")
+    p.add_argument("--opd-res-batches", type=int, nargs="+", default=[],
+                   help="explicit global image batches in --opd-resolutions order, each a multiple of --batch")
     p.add_argument("--opd-token-batch", action="store_true",
                    help="scale images per rollout batch by round((res_max/res)^2); --batch is the largest-resolution batch")
     p.add_argument("--opd-res-mb", type=int, nargs="+", default=[],

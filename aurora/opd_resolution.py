@@ -33,6 +33,11 @@ def balanced_dance_picks(seed, step, replica, replicas, batch, states, steps, be
 
 def validate(args):
     resolutions = args.opd_resolutions
+    batches = getattr(args, "opd_res_batches", ())
+    if batches:
+        if len(batches) != len(resolutions) or args.batch <= 0 or any(b <= 0 or b % args.batch for b in batches):
+            raise ValueError("--opd-res-batches needs one positive multiple of --batch per resolution")
+        args.opd_token_batch = True
     microbatches = getattr(args, "opd_res_mb", ())
     if microbatches and (not resolutions or len(microbatches) != len(resolutions) or
                          any(v <= 0 for v in microbatches)):
@@ -83,6 +88,8 @@ def time_shift(args, resolution):
 
 def batch_multiplier(args, resolution):
     """Whole base batches keep replica / microbatch / OPD-part divisibility intact."""
+    if getattr(args, "opd_res_batches", ()):
+        return args.opd_res_batches[args.opd_resolutions.index(resolution)] // args.batch
     return max(1, round((args.res / resolution) ** 2)) if getattr(args, "opd_token_batch", False) else 1
 
 
