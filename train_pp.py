@@ -189,6 +189,7 @@ def get_args():
                    help="--diffusion-opd / --dance-opd: the --lm-rank server(s) also host klein (needs --klein-quant) and take a share of the "
                         "states like the --teacher-ranks; that GPU is otherwise ~99%% idle during OPD")
     p.add_argument("--opd-balance-rollouts", action="store_true", help="balance DanceOPD rollout forwards across learners; implies local sorting")
+    p.add_argument("--opd-captions-only", action="store_true", help="skip training image reads for multi-resolution OPD from a single image dataset")
     p.add_argument("--opd-sort-rollouts", action="store_true", help="sort local trajectories by last queried Euler step before partitioning")
     p.add_argument("--opd-rollout-steps", type=int, default=16, help="--diffusion-opd / --dance-opd: Euler steps of the student's trajectories")
     p.add_argument("--opd-actor", action="store_true",
@@ -1107,6 +1108,8 @@ def main():
                                        time_shift as opd_time_shift, batch_multiplier, gather_caption_batches,
                                        microbatch_size, validate_microbatches)
     validate_opd_resolution(args)
+    if args.opd_captions_only and not (args.opd_resolutions and args.img_dir and not args.img_extra):
+        raise ValueError("--opd-captions-only requires --opd-resolutions and a single --img-dir")
     if args.opd_resolutions:
         torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 64)
     assert args.opd_reuse >= 1, "--opd-reuse must be >= 1"
@@ -1598,9 +1601,9 @@ def main():
         stream = TrainStream(store, per_pipe, replica, replicas, args.seed, start_micro=opd_data_batches if args.opd else step,
                              sort_pad=LM_PAD if hf_lm else None, rows=args.opd,
                              res_groups=[(r, n * k) for r, n, k in mr_groups] or None,
-                             captions_only=args.opd_actor and not crops and isinstance(store, ShardStore))
+                             captions_only=args.opd_captions_only or (args.opd_actor and not crops and isinstance(store, ShardStore)))
         if stream.captions_only:
-            log("OPD actor data: captions only; no training image/latent reads or JPEG decoding")
+            log("OPD training data: captions only; no training image/latent reads or JPEG decoding")
         loader = iter(torch.utils.data.DataLoader(stream, batch_size=None, num_workers=args.workers,
                                                   pin_memory=device.type == "cuda",
                                                   prefetch_factor=2 if args.workers else None,
@@ -1950,11 +1953,14 @@ def main():
             t = shift_t(torch.sigmoid(torch.randn(per_pipe, device=device, generator=g)), args.res)  # as stage 0
             eps = torch.randn(shape, device=device, generator=g)
             return torch.empty(shape, device=device), None, t, eps, None, None, None, None
+        load_start = time.perf_counter() if args.opd_learner_profile else None
         with profile.phase("data_loader"):
             got = load_rollout_batch(at) if args.opd_token_batch else next(loader)
             mcond = got[-1].to(device, non_blocking=True) if has_cond else None
             got = got[:-1] if has_cond else got
             lat, ids, rows = got if args.opd else (*got, None)
+        if load_start is not None and (at + 1) % args.log_every == 0:
+            print(f"[learner data] target_step={at + 1} rank={rank} images={len(ids)} loader_wall={time.perf_counter() - load_start:.3f}s", flush=True)
         ids_cpu = ids
         batch_n = len(ids)
         side = batch_resolution(args, at) // 16 if args.opd_resolutions else den_cfg.latent_size
