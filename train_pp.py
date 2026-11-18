@@ -49,6 +49,7 @@ import math
 import os
 import re
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 
 # GPU numbers as in nvidia-smi (--lm-gpu, --vae-gpu, --skip-gpus): set before torch (or any import) can initialise CUDA
@@ -195,6 +196,8 @@ def get_args():
                    help="GPU for the rollout actor in CUDA_DEVICE_ORDER numbering; -1 uses rank order; needs --opd-actor")
     p.add_argument("--opd-actor-gpus", type=int, nargs="+", default=[],
                    help="dedicated actor GPUs, e.g. 2 7; replaces --opd-actor-gpu, learners assigned round-robin")
+    p.add_argument("--opd-learner-profile", action="store_true",
+                   help="report per-rank fresh OPD phase times at logging steps (local rollouts, reuse 1)")
     p.add_argument("--opd-actor-profile", action="store_true",
                    help="log actor LM, rollout, teacher, CPU-copy and send timings per learner job")
     p.add_argument("--opd-prefetch", action="store_true",
@@ -865,13 +868,15 @@ def opd_step(stage, teacher, qwen_tok, texts_en, eps, ids, ids_cpu, mb, args, st
             stage.lm_states = [full[i:i + mb] for i in range(0, len(full), mb)]
         ids_c = rep(ids_cpu[b0:b1]) if ids_cpu is not None else None
         w_rep = text_widths(ids_c, mb, args.text_bucket) if ids_c is not None and args.text_bucket else None
-        target = teacher.collect(h)
+        with phase("teacher_collect"):
+            target = teacher.collect(h)
         if cache is not None:
             cache["chunks"].append((b0, b1, x.detach(), t.detach(), target.detach()))
         try:
-            return local_train_step(stage, x, t, rep(ids[b0:b1]), target, mb, losses, w_rep,
-                                    divide=False,
-                                    state_errors=cache["errors"] if cache is not None and cache["weighting"] else None)
+            with phase("student_forward_backward"):
+                return local_train_step(stage, x, t, rep(ids[b0:b1]), target, mb, losses, w_rep,
+                                        divide=False,
+                                        state_errors=cache["errors"] if cache is not None and cache["weighting"] else None)
         finally:
             stage.lm_states = states
 
@@ -1104,6 +1109,9 @@ def main():
     assert args.opd_actor or args.opd_actor_gpu == -1, "--opd-actor-gpu needs --opd-actor"
     assert not args.opd_actor_gpus or (args.opd_actor and args.opd_actor_gpu == -1), "Use --opd-actor-gpus with --opd-actor, without --opd-actor-gpu"
     assert len(set(args.opd_actor_gpus)) == len(args.opd_actor_gpus), "Actor GPUs must be distinct"
+    if args.opd_learner_profile:
+        assert args.opd and args.opd_reuse == 1 and not args.opd_actor, \
+            "--opd-learner-profile measures fresh local rollouts (OPD, reuse 1, no dedicated actor)"
     assert not args.opd_actor_profile or args.opd_actor, "--opd-actor-profile needs --opd-actor"
     assert args.opd_text_ahead >= 0
     assert not args.opd_text_ahead or (args.opd_actor and not args.teacher_on_lm and args.teacher_ranks > 0), \
@@ -2050,6 +2058,10 @@ def main():
     dist.barrier(group=train_group, device_ids=[device.index] if device.type == "cuda" else None)
     while step < args.steps:
         profile.begin_step(step + 1)
+        learner_timing = None
+        if args.opd_learner_profile and ((step + 1) % args.log_every == 0 or step + 1 == args.steps):
+            from aurora.opd_actor import ActorTimings
+            learner_timing = ActorTimings(device)
         actor_wait_seconds = actor_snapshot_seconds = 0.0
         replay = args.opd and bool(opd_cache) and opd_pass < args.opd_reuse
         prepared = not replay and opd_next is not None
@@ -2222,9 +2234,10 @@ def main():
                         tt = t.view(-1, 1, 1, 1)
                         z_t = (1 - tt) * x0 + tt * eps
                         if args.opd:
-                            opd_step(stage_mod, teacher_client, qwen_tok, captions_en(rows.tolist()), eps, cond_ids,
-                                     cond_cpu, mb, args, step, replica, losses, parts=args.opd_parts,
-                                     cache=opd_cache if args.opd_reuse > 1 else None)
+                            with learner_timing.measure("local_opd") if learner_timing else nullcontext():
+                                opd_step(stage_mod, teacher_client, qwen_tok, captions_en(rows.tolist()), eps, cond_ids,
+                                         cond_cpu, mb, args, step, replica, losses, parts=args.opd_parts,
+                                         cache=opd_cache if args.opd_reuse > 1 else None, timings=learner_timing)
                         elif pp == 1:
                             widths = (text_widths(cond_cpu, mb, args.text_bucket)
                                       if cond_cpu is not None and args.text_bucket else None)
@@ -2316,6 +2329,10 @@ def main():
                 torch._foreach_lerp_(ema, [p.detach().float() for p in model_params], 1 - d)
 
         if step % args.log_every == 0 or step == args.steps:
+            if learner_timing is not None:
+                times = learner_timing.finish()
+                print(f"[learner profile] step {step} rank {rank} {active_opd_res}px "
+                      + " ".join(f"{key}={value:.3f}s" for key, value in times.items()), flush=True)
             dist.all_reduce(acc, group=train_group)
             n = step - t_last
             if device.type == "cuda":
